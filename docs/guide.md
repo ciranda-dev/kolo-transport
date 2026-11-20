@@ -4,7 +4,7 @@ How to use kolo-transport beyond the README quick start. Every default and bound
 
 ## API
 
-v0.1.x is IPv4 only. Sockets are `udp4`. An IPv6 address, the v4-mapped
+kolo-transport is IPv4 only. Sockets are `udp4`. An IPv6 address, the v4-mapped
 form `::ffff:a.b.c.d` included, is refused with `ErrInvalidArgument`, and a
 `Network` other than `"udp4"` with `ErrInvalidConfig`. A host name with no
 IPv4 address fails to resolve.

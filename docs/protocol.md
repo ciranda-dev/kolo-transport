@@ -8,7 +8,7 @@
 - Non-QUIC datagrams are capped at 1200 bytes, the size QUIC starts with, so they fit any path QUIC works on.
 - `Conn.Context` wraps quic-go's connection context and maps its cause, so no quic-go error or peer text escapes through `context.Cause`.
 - Bidirectional streams for request and reply, unidirectional ones for one-way data; streams carry raw bytes.
-- Datagrams are not exposed in v0.1.x: unreliable messages need their own size, queue and rate limits.
+- Datagrams are not exposed: unreliable messages need their own size, queue and rate limits.
 - Keep-alive is always on. quic-go sends a PING after min(`KeepAlivePeriod`, idle timeout / 2) without receiving anything, raised to at least 1.5 times the probe timeout. A connection stays open while the peer answers and ends after the idle timeout once the peer or the path is gone. Close connections you no longer need, and accept the ones that arrive. Each side's idle timeout is min(own `IdleTimeout`, max(peer's `IdleTimeout`, 5s)), because quic-go raises the peer's value to at least 5s (`connection.go`), so below 5s the two sides can time out at different moments.
 - `HandshakeTimeout` bounds the whole handshake; `IdleTimeout` applies after it.
 - Every limit has a default and a hard maximum, checked before anything is opened. The receive windows are advanced options with small defaults (256 KiB per stream, 512 KiB per connection), and `MaxIncomingStreams` defaults to 16, because with 1-byte frames each unread byte costs about 176 bytes of heap and each byte read on a stream still open keeps about 96 (measured); `MaxMemory` checks that `MaxConns` plus `MaxDialed` connections fit.
