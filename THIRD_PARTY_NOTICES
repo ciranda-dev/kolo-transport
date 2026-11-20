@@ -1,0 +1,106 @@
+# Third-party notices
+
+kolo-transport is licensed under Apache-2.0 (see LICENSE) or MIT (see LICENSE-MIT), at your option. It contains code from
+three projects: two licensed under the MIT license and one under the 3-clause BSD license. Their copyright and permission
+notices follow, as those licenses require. Each copy also keeps its license file in its directory where the project has one.
+
+## internal/quicgo
+
+The QUIC implementation, quic-go v0.65.0 (https://github.com/quic-go/quic-go), the non-test Go files of the packages the
+connection needs. It is changed by internal/quicgo/PATCH, which adds a hook for a congestion controller, and its
+import paths are rewritten to this module. The hook follows the one in apernet/quic-go (https://github.com/apernet/quic-go,
+commit 2895f039137a, a fork of quic-go): internal/quicgo/congestion/interface.go is derived from that fork's
+congestion/interface.go, and the adapter in internal/quicgo/internal/ackhandler/cc_adapter.go follows its design. The fork's
+license is the same text as the one below, with the same copyright line. The license file is internal/quicgo/LICENSE.
+
+```text
+MIT License
+
+Copyright (c) 2016 the quic-go authors & Google, Inc.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+## internal/bbr
+
+The BBR congestion controller, from the core/internal/congestion directory of Hysteria
+(https://github.com/apernet/hysteria, repository head c2b181e0b0e72b077e4b0b7297735af14d1f9929, the directory last
+changed in commit 93f68c526b2bf5b45ac7d8577698aa754b699ffc). Changed here: the tests, the debug output, the profile
+parsing, the conservative and aggressive profiles with the options only they turned on (overestimate avoidance, drain to
+target, overshoot detection, ack aggregation in start-up) and the helper functions that nothing calls are removed, a span cap
+on the packet-number queue is added (see docs/limits.md), the rate arithmetic cannot overflow, the pacer is part of the package, imports point to
+internal/quicgo, a datagram size that shrinks is ignored instead of a panic, and the pacer starts with the connection's
+first datagram size. The license file is internal/bbr/LICENSE.md.
+
+The code in internal/bbr has three origins, and a license applies to each:
+
+- Hysteria itself, under the MIT license below ("Copyright 2023 Toby").
+- bbr_sender.go, bandwidth_sampler.go, bandwidth.go and windowed_filter.go are a port of Google's QUIC BBR (the QUICHE
+  sources, formerly in Chromium). Their comments keep the names of that code (`kStartupGrowthTarget`,
+  `quic_bbr_cwnd_gain`, `QuicBandwidth::Zero()`, "Kathleen Nichols' algorithm"). The files in Hysteria carry no header, so
+  the port is known from these comments and not from a statement of Hysteria; the matching QUICHE files (for example
+  bbr_sender.cc) carry "Copyright 2016 The Chromium Authors" and refer to the BSD-style license that follows, so that
+  notice is kept here.
+- ringbuffer.go and pacer.go follow files of quic-go (internal/utils/ringbuffer and internal/congestion/pacer.go), which
+  are under the quic-go license in the internal/quicgo section above.
+
+```text
+Copyright 2023 Toby
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the “Software”), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+```
+
+## BSD 3-clause license of the QUICHE sources
+
+Applies to the port of Google's BBR in internal/bbr (see above). The text is that of the LICENSE file of
+https://github.com/google/quiche.
+
+```text
+Copyright 2015 The Chromium Authors. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
+
+   * Redistributions of source code must retain the above copyright
+notice, this list of conditions and the following disclaimer.
+   * Redistributions in binary form must reproduce the above
+copyright notice, this list of conditions and the following disclaimer
+in the documentation and/or other materials provided with the
+distribution.
+   * Neither the name of Google Inc. nor the names of its
+contributors may be used to endorse or promote products derived from
+this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```

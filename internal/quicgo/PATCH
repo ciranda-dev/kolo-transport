@@ -1,0 +1,778 @@
+Changes to quic-go v0.65.0, applied by scripts/vendor-quicgo.sh (patch -p1, before the import paths are rewritten).
+The patch is the only edit to the vendored code. It adds a hook for a pluggable congestion controller and the statistics kolotransport.Conn.Stats reads, and nothing else.
+
+  congestion/interface.go (new)          the controller interface, AckedPacketInfo and LostPacketInfo
+  monotime/time.go (new)                 exports the clock type the controller interface uses
+  internal/ackhandler/cc_adapter.go (new) lets a controller stand in for the built-in sender and keeps
+                                         ConnectionStats (CongestionWindow, PacketsLost, BytesLost, BandwidthEstimate)
+                                         current; its Name is the controller's own
+  internal/ackhandler/sent_packet_handler.go
+                                         every congestion call goes through getCongestionControl; the acked and lost
+                                         packets of each ACK or loss timer event are passed to a controller that takes
+                                         them together (a lost Path MTU probe is not a congestion loss); the controller
+                                         is built by ccFactory, set with SetCongestionControlFactory, and built again
+                                         after a path migration (the built-in sender would silently come back)
+                                         only the packets of the application data space reach a pluggable controller (the
+                                         Initial and Handshake spaces number their own packets from 0)
+                                         SetCubic switches the built-in sender from Reno to Cubic (the sender's reno
+                                         flag was hard-coded to true) and a migration keeps it; BytesInFlight is
+                                         published to ConnectionStats at each change
+  internal/ackhandler/interfaces.go      SetCongestionControlFactory, SetCubic and CongestionControlName on the sent packet handler
+  internal/congestion/interface.go       SendAlgorithmEx, the controller with the event method
+  internal/congestion/cubic_sender.go    Name, "reno" or "cubic"
+  connection.go                          Conn.SetCongestionControlFactory, Conn.UseCubic, Conn.CongestionControlName;
+                                         ConnectionStats gets HasRTT, BytesInFlight, BandwidthEstimate,
+                                         MaxDatagramSize and PathChanges
+  internal/utils/connstats.go            the counters behind those fields
+  internal/utils/rtt_stats.go            hasMeasurement is atomic, so another goroutine can read it
+
+diff -ruN a/congestion/interface.go b/congestion/interface.go
+--- a/congestion/interface.go
++++ b/congestion/interface.go
+@@ -0,0 +1,60 @@
++// Package congestion is the interface of a pluggable congestion controller.
++package congestion
++
++import (
++	"time"
++
++	"github.com/quic-go/quic-go/internal/protocol"
++	"github.com/quic-go/quic-go/monotime"
++)
++
++type (
++	ByteCount    protocol.ByteCount
++	PacketNumber protocol.PacketNumber
++)
++
++const (
++	InitialPacketSize          = protocol.InitialPacketSize
++	MaxPacketBufferSize        = protocol.MaxPacketBufferSize
++	MaxCongestionWindowPackets = protocol.MaxCongestionWindowPackets
++	PacketsPerConnectionID     = protocol.PacketsPerConnectionID
++)
++
++// MinPacingDelay is the value of the unexported constant of the same name in internal/congestion.
++const MinPacingDelay = time.Millisecond
++
++type AckedPacketInfo struct {
++	PacketNumber PacketNumber
++	BytesAcked   ByteCount
++}
++
++type LostPacketInfo struct {
++	PacketNumber PacketNumber
++	BytesLost    ByteCount
++}
++
++type CongestionControl interface {
++	SetRTTStatsProvider(provider RTTStatsProvider)
++	TimeUntilSend(bytesInFlight ByteCount) monotime.Time
++	HasPacingBudget(now monotime.Time) bool
++	OnPacketSent(sentTime monotime.Time, bytesInFlight ByteCount, packetNumber PacketNumber, bytes ByteCount, isRetransmittable bool)
++	CanSend(bytesInFlight ByteCount) bool
++	MaybeExitSlowStart()
++	OnPacketAcked(number PacketNumber, ackedBytes ByteCount, priorInFlight ByteCount, eventTime monotime.Time)
++	OnCongestionEvent(number PacketNumber, lostBytes ByteCount, priorInFlight ByteCount)
++	OnRetransmissionTimeout(packetsRetransmitted bool)
++	SetMaxDatagramSize(size ByteCount)
++	InSlowStart() bool
++	InRecovery() bool
++	GetCongestionWindow() ByteCount
++}
++
++// CongestionControlEx also receives every acknowledgment and loss of one ACK or loss timer event together.
++type CongestionControlEx interface {
++	CongestionControl
++	OnCongestionEventEx(priorInFlight ByteCount, eventTime monotime.Time, ackedPackets []AckedPacketInfo, lostPackets []LostPacketInfo)
++}
++
++type RTTStatsProvider interface {
++	MinRTT() time.Duration
++}
+diff -ruN a/connection.go b/connection.go
+--- a/connection.go
++++ b/connection.go
+@@ -16,6 +16,7 @@
+ 	"sync/atomic"
+ 	"time"
+ 
++	"github.com/quic-go/quic-go/congestion"
+ 	"github.com/quic-go/quic-go/internal/ackhandler"
+ 	"github.com/quic-go/quic-go/internal/handshake"
+ 	"github.com/quic-go/quic-go/internal/monotime"
+@@ -804,11 +805,26 @@
+ 	// MeanDeviation estimates the variation in the RTT samples using a mean
+ 	// variation. See https://www.rfc-editor.org/rfc/rfc9002#section-5.3
+ 	MeanDeviation time.Duration
++	// HasRTT is false until the active network path has an RTT sample: the
++	// RTT fields then hold the initial guess, not a measurement.
++	HasRTT bool
+ 
+ 	// CongestionWindow is the local sender's congestion window on the active
+ 	// network path, in bytes. It limits bytes in flight and includes QUIC
+ 	// packet overhead, excluding UDP and IP headers.
+ 	CongestionWindow uint64
++	// BytesInFlight is the number of bytes of ack-eliciting packets sent and
++	// not yet acknowledged or declared lost.
++	BytesInFlight uint64
++	// BandwidthEstimate is the bandwidth estimate of the congestion
++	// controller, in bytes per second, or 0 when the controller keeps none.
++	BandwidthEstimate uint64
++	// MaxDatagramSize is the largest UDP payload the connection sends on the
++	// active network path, in bytes.
++	MaxDatagramSize uint64
++	// PathChanges is the number of times the connection moved to another
++	// network path.
++	PathChanges uint64
+ 
+ 	// BytesSent is the number of bytes sent on the underlying connection,
+ 	// including retransmissions. Does not include UDP or any other outer
+@@ -843,8 +859,13 @@
+ 		LatestRTT:     c.rttStats.LatestRTT(),
+ 		SmoothedRTT:   c.rttStats.SmoothedRTT(),
+ 		MeanDeviation: c.rttStats.MeanDeviation(),
++		HasRTT:        c.rttStats.HasMeasurement(),
+ 
+-		CongestionWindow: c.connStats.CongestionWindow.Load(),
++		CongestionWindow:  c.connStats.CongestionWindow.Load(),
++		BytesInFlight:     c.connStats.BytesInFlight.Load(),
++		BandwidthEstimate: c.connStats.BandwidthEstimate.Load(),
++		MaxDatagramSize:   uint64(c.maxPayloadSizeEstimate.Load()) + maxPayloadOverhead,
++		PathChanges:       c.connStats.PathChanges.Load(),
+ 
+ 		BytesSent:       c.connStats.BytesSent.Load(),
+ 		PacketsSent:     c.connStats.PacketsSent.Load(),
+@@ -935,6 +956,7 @@
+ 
+ 	initialPacketSize := protocol.ByteCount(cmp.Or(c.config.InitialPacketSize, protocol.MinInitialPacketSize))
+ 	c.sentPacketHandler.MigratedPath(now, initialPacketSize)
++	c.connStats.PathChanges.Add(1)
+ 	c.maxPayloadSizeEstimate.Store(uint32(estimateMaxPayloadSize(initialPacketSize)))
+ 	c.mtuDiscoverer.Reset(initialPacketSize, c.maxMTU())
+ 	c.conn = newSendConn(tr.conn, c.conn.RemoteAddr(), packetInfo{}, utils.DefaultLogger) // TODO: find a better way
+@@ -1324,6 +1346,7 @@
+ 	c.connIDManager.SwitchToPath(path)
+ 	initialPacketSize := protocol.ByteCount(cmp.Or(c.config.InitialPacketSize, protocol.MinInitialPacketSize))
+ 	c.sentPacketHandler.MigratedPath(p.rcvTime, initialPacketSize)
++	c.connStats.PathChanges.Add(1)
+ 	c.maxPayloadSizeEstimate.Store(uint32(estimateMaxPayloadSize(initialPacketSize)))
+ 	c.mtuDiscoverer.Reset(initialPacketSize, c.maxMTU())
+ 	if !c.config.DisablePathMTUDiscovery && c.conn.capabilities().DF {
+@@ -3261,5 +3284,24 @@
+ // It is not very sophisticated: it just subtracts the size of header (assuming the maximum
+ // connection ID length), and the size of the encryption tag.
+ func estimateMaxPayloadSize(mtu protocol.ByteCount) protocol.ByteCount {
+-	return mtu - 1 /* type byte */ - 20 /* maximum connection ID length */ - 16 /* tag size */
++	return mtu - maxPayloadOverhead
++}
++
++// maxPayloadOverhead is the type byte, the maximum connection ID length and the tag size.
++const maxPayloadOverhead = 1 + 20 + 16
++
++// SetCongestionControlFactory replaces the congestion controller of the connection with the one f builds,
++// and builds a new one with f after every path migration. f gets the current maximum datagram size.
++func (c *Conn) SetCongestionControlFactory(f func(congestion.ByteCount) congestion.CongestionControl) {
++	c.sentPacketHandler.SetCongestionControlFactory(f, c.config.initialPacketSize())
++}
++
++// UseCubic replaces the Reno sender of the connection with the built-in Cubic one, which a path migration keeps.
++func (c *Conn) UseCubic() {
++	c.sentPacketHandler.SetCubic(c.config.initialPacketSize())
++}
++
++// CongestionControlName is "reno" or "cubic" for the built-in sender and "custom" for a controller set with SetCongestionControlFactory.
++func (c *Conn) CongestionControlName() string {
++	return c.sentPacketHandler.CongestionControlName()
+ }
+diff -ruN a/internal/ackhandler/cc_adapter.go b/internal/ackhandler/cc_adapter.go
+--- a/internal/ackhandler/cc_adapter.go
++++ b/internal/ackhandler/cc_adapter.go
+@@ -0,0 +1,106 @@
++package ackhandler
++
++import (
++	"github.com/quic-go/quic-go/congestion"
++	cgInternal "github.com/quic-go/quic-go/internal/congestion"
++	"github.com/quic-go/quic-go/internal/monotime"
++	"github.com/quic-go/quic-go/internal/protocol"
++	"github.com/quic-go/quic-go/internal/utils"
++)
++
++var (
++	_ cgInternal.SendAlgorithmWithDebugInfos = &ccAdapter{}
++	_ cgInternal.SendAlgorithmEx             = &ccAdapterEx{}
++)
++
++// ccAdapter lets a pluggable controller stand in for the built-in sender. The built-in sender
++// keeps the connection stats current; the adapter does the same for the controller.
++type ccAdapter struct {
++	cc        congestion.CongestionControl
++	connStats *utils.ConnectionStats
++}
++
++// Name is the controller's own name, or "custom" when it has none.
++func (a *ccAdapter) Name() string {
++	if n, ok := a.cc.(interface{ Name() string }); ok {
++		return n.Name()
++	}
++	return "custom"
++}
++
++func (a *ccAdapter) pluggable() {}
++
++func (a *ccAdapter) updateStats() {
++	a.connStats.CongestionWindow.Store(uint64(a.cc.GetCongestionWindow()))
++	if b, ok := a.cc.(interface{ BandwidthEstimate() uint64 }); ok {
++		a.connStats.BandwidthEstimate.Store(b.BandwidthEstimate())
++	}
++}
++
++func (a *ccAdapter) TimeUntilSend(bytesInFlight protocol.ByteCount) monotime.Time {
++	return a.cc.TimeUntilSend(congestion.ByteCount(bytesInFlight))
++}
++
++func (a *ccAdapter) HasPacingBudget(now monotime.Time) bool {
++	return a.cc.HasPacingBudget(now)
++}
++
++func (a *ccAdapter) OnPacketSent(sentTime monotime.Time, bytesInFlight protocol.ByteCount, packetNumber protocol.PacketNumber, bytes protocol.ByteCount, isRetransmittable bool) {
++	a.cc.OnPacketSent(sentTime, congestion.ByteCount(bytesInFlight), congestion.PacketNumber(packetNumber), congestion.ByteCount(bytes), isRetransmittable)
++}
++
++func (a *ccAdapter) CanSend(bytesInFlight protocol.ByteCount) bool {
++	return a.cc.CanSend(congestion.ByteCount(bytesInFlight))
++}
++
++func (a *ccAdapter) MaybeExitSlowStart() {
++	a.cc.MaybeExitSlowStart()
++}
++
++func (a *ccAdapter) OnPacketAcked(number protocol.PacketNumber, ackedBytes protocol.ByteCount, priorInFlight protocol.ByteCount, eventTime monotime.Time) {
++	a.cc.OnPacketAcked(congestion.PacketNumber(number), congestion.ByteCount(ackedBytes), congestion.ByteCount(priorInFlight), eventTime)
++	a.updateStats()
++}
++
++func (a *ccAdapter) OnCongestionEvent(number protocol.PacketNumber, lostBytes protocol.ByteCount, priorInFlight protocol.ByteCount) {
++	a.connStats.PacketsLost.Add(1)
++	a.connStats.BytesLost.Add(uint64(lostBytes))
++	a.cc.OnCongestionEvent(congestion.PacketNumber(number), congestion.ByteCount(lostBytes), congestion.ByteCount(priorInFlight))
++	a.updateStats()
++}
++
++// OnSpuriousLoss does nothing: the controller interface has no way to undo a congestion event.
++func (a *ccAdapter) OnSpuriousLoss(protocol.PacketNumber) {}
++
++func (a *ccAdapter) OnRetransmissionTimeout(packetsRetransmitted bool) {
++	a.cc.OnRetransmissionTimeout(packetsRetransmitted)
++	a.updateStats()
++}
++
++func (a *ccAdapter) SetMaxDatagramSize(size protocol.ByteCount) {
++	a.cc.SetMaxDatagramSize(congestion.ByteCount(size))
++	a.updateStats()
++}
++
++func (a *ccAdapter) InSlowStart() bool {
++	return a.cc.InSlowStart()
++}
++
++func (a *ccAdapter) InRecovery() bool {
++	return a.cc.InRecovery()
++}
++
++func (a *ccAdapter) GetCongestionWindow() protocol.ByteCount {
++	return protocol.ByteCount(a.cc.GetCongestionWindow())
++}
++
++// ccAdapterEx is the adapter of a controller that takes the acknowledgments and losses of an event together.
++type ccAdapterEx struct {
++	*ccAdapter
++	ex congestion.CongestionControlEx
++}
++
++func (a *ccAdapterEx) OnCongestionEventEx(priorInFlight protocol.ByteCount, eventTime monotime.Time, ackedPackets []congestion.AckedPacketInfo, lostPackets []congestion.LostPacketInfo) {
++	a.ex.OnCongestionEventEx(congestion.ByteCount(priorInFlight), eventTime, ackedPackets, lostPackets)
++	a.updateStats()
++}
+diff -ruN a/internal/ackhandler/interfaces.go b/internal/ackhandler/interfaces.go
+--- a/internal/ackhandler/interfaces.go
++++ b/internal/ackhandler/interfaces.go
+@@ -1,6 +1,7 @@
+ package ackhandler
+ 
+ import (
++	"github.com/quic-go/quic-go/congestion"
+ 	"github.com/quic-go/quic-go/internal/monotime"
+ 	"github.com/quic-go/quic-go/internal/protocol"
+ 	"github.com/quic-go/quic-go/internal/wire"
+@@ -24,6 +25,12 @@
+ 	// It is used for pacing packets.
+ 	TimeUntilSend() monotime.Time
+ 	SetMaxDatagramSize(count protocol.ByteCount)
++	// SetCongestionControlFactory replaces the congestion controller now and after every path migration.
++	SetCongestionControlFactory(f func(congestion.ByteCount) congestion.CongestionControl, initialSize protocol.ByteCount)
++	// SetCubic replaces the Reno sender with the built-in Cubic one, now and after every path migration.
++	SetCubic(initialSize protocol.ByteCount)
++	// CongestionControlName is "reno" or "cubic" for the built-in sender and "custom" for a controller from a factory.
++	CongestionControlName() string
+ 
+ 	// only to be called once the handshake is complete
+ 	QueueProbePacket(protocol.PacketNumberSpace) bool /* was a packet queued */
+diff -ruN a/internal/ackhandler/sent_packet_handler.go b/internal/ackhandler/sent_packet_handler.go
+--- a/internal/ackhandler/sent_packet_handler.go
++++ b/internal/ackhandler/sent_packet_handler.go
+@@ -3,8 +3,10 @@
+ import (
+ 	"errors"
+ 	"fmt"
++	"sync"
+ 	"time"
+ 
++	congestionExt "github.com/quic-go/quic-go/congestion"
+ 	"github.com/quic-go/quic-go/internal/congestion"
+ 	"github.com/quic-go/quic-go/internal/monotime"
+ 	"github.com/quic-go/quic-go/internal/protocol"
+@@ -108,13 +110,18 @@
+ 
+ 	ignorePacketsBelow func(protocol.PacketNumber)
+ 
+-	ackedPackets []packetWithPacketNumber // to avoid allocations in detectAndRemoveAckedPackets
++	ackedPackets     []packetWithPacketNumber // to avoid allocations in detectAndRemoveAckedPackets
++	ackedPacketsInfo []congestionExt.AckedPacketInfo
++	lostPacketsInfo  []congestionExt.LostPacketInfo
+ 
+ 	bytesInFlight protocol.ByteCount
+ 
+-	congestion congestion.SendAlgorithmWithDebugInfos
+-	rttStats   *utils.RTTStats
+-	connStats  *utils.ConnectionStats
++	congestion      congestion.SendAlgorithmWithDebugInfos
++	congestionMutex sync.RWMutex // guards congestion and ccFactory
++	ccFactory       func(congestionExt.ByteCount) congestionExt.CongestionControl
++	cubic           bool // the built-in sender runs Cubic, not Reno
++	rttStats        *utils.RTTStats
++	connStats       *utils.ConnectionStats
+ 
+ 	// The number of times a PTO has been sent without receiving an ack.
+ 	ptoCount uint32
+@@ -203,7 +210,7 @@
+ 		TimerGranularity:        protocol.TimerGranularity,
+ 	}
+ 	if initial {
+-		ev.InitialCongestionWindow = h.congestion.GetCongestionWindow()
++		ev.InitialCongestionWindow = h.getCongestionControl().GetCongestionWindow()
+ 		ev.InitialRTT = h.rttStats.SmoothedRTT()
+ 	}
+ 	h.qlogger.RecordEvent(ev)
+@@ -215,6 +222,7 @@
+ 			panic("negative bytes_in_flight")
+ 		}
+ 		h.bytesInFlight -= p.Length
++		h.connStats.BytesInFlight.Store(uint64(h.bytesInFlight))
+ 		if p.Outstanding() {
+ 			h.getPacketNumberSpace(p.EncryptionLevel.PacketNumberSpace()).numOutstanding--
+ 		}
+@@ -339,12 +347,16 @@
+ 	if isAckEliciting {
+ 		pnSpace.lastAckElicitingPacketTime = t
+ 		h.bytesInFlight += size
++		h.connStats.BytesInFlight.Store(uint64(h.bytesInFlight))
+ 		p.includedInBytesInFlight = true
+ 		if h.numProbesToSend > 0 {
+ 			h.numProbesToSend--
+ 		}
+ 	}
+-	h.congestion.OnPacketSent(t, h.bytesInFlight, pn, size, isAckEliciting)
++	cc := h.getCongestionControl()
++	if controllerSees(cc, encLevel) {
++		cc.OnPacketSent(t, h.bytesInFlight, pn, size, isAckEliciting)
++	}
+ 
+ 	if encLevel == protocol.Encryption1RTT && h.ecnTracker != nil {
+ 		h.ecnTracker.SentPacket(pn, ecn)
+@@ -391,7 +403,7 @@
+ 			updated = true
+ 		}
+ 	}
+-	if cwnd := h.congestion.GetCongestionWindow(); h.lastMetrics.CongestionWindow != int(cwnd) {
++	if cwnd := h.getCongestionControl().GetCongestionWindow(); h.lastMetrics.CongestionWindow != int(cwnd) {
+ 		metricsUpdatedEvent.CongestionWindow = int(cwnd)
+ 		h.lastMetrics.CongestionWindow = metricsUpdatedEvent.CongestionWindow
+ 		updated = true
+@@ -467,10 +479,13 @@
+ 				}
+ 				h.largestAckedTime = p.SendTime
+ 			}
+-			h.congestion.MaybeExitSlowStart()
++			h.getCongestionControl().MaybeExitSlowStart()
+ 		}
+ 	}
+ 
++	h.ackedPacketsInfo = h.ackedPacketsInfo[:0]
++	h.lostPacketsInfo = h.lostPacketsInfo[:0]
++
+ 	// Detect spurious losses even if no outstanding packets were newly acknowledged.
+ 	var spuriousLosses []protocol.PacketNumber
+ 	var timeThresholdIncreased bool
+@@ -487,7 +502,7 @@
+ 		if encLevel == protocol.Encryption1RTT && h.ecnTracker != nil && largestAcked > pnSpace.largestAcked {
+ 			congested := h.ecnTracker.HandleNewlyAcked(ackedPackets, int64(ack.ECT0), int64(ack.ECT1), int64(ack.ECNCE))
+ 			if congested {
+-				h.congestion.OnCongestionEvent(largestAcked, 0, priorInFlight)
++				h.getCongestionControl().OnCongestionEvent(largestAcked, 0, priorInFlight)
+ 			}
+ 		}
+ 
+@@ -503,9 +518,12 @@
+ 	}
+ 	// report spurious losses after any new congestion events from this ACK
+ 	for _, pn := range spuriousLosses {
+-		h.congestion.OnSpuriousLoss(pn)
++		h.getCongestionControl().OnSpuriousLoss(pn)
+ 	}
+ 	if len(ackedPackets) == 0 {
++		if cex, ok := h.getCongestionControl().(congestion.SendAlgorithmEx); ok && len(h.lostPacketsInfo) != 0 {
++			cex.OnCongestionEventEx(priorInFlight, rcvTime, nil, h.lostPacketsInfo)
++		}
+ 		if len(spuriousLosses) > 0 && h.qlogger != nil {
+ 			h.qlogMetricsUpdated()
+ 		}
+@@ -517,8 +535,12 @@
+ 
+ 	var acked1RTTPacket bool
+ 	for _, p := range ackedPackets {
+-		if p.includedInBytesInFlight {
+-			h.congestion.OnPacketAcked(p.PacketNumber, p.Length, priorInFlight, rcvTime)
++		if cc := h.getCongestionControl(); p.includedInBytesInFlight && controllerSees(cc, p.EncryptionLevel) {
++			cc.OnPacketAcked(p.PacketNumber, p.Length, priorInFlight, rcvTime)
++			h.ackedPacketsInfo = append(h.ackedPacketsInfo, congestionExt.AckedPacketInfo{
++				PacketNumber: congestionExt.PacketNumber(p.PacketNumber),
++				BytesAcked:   congestionExt.ByteCount(p.Length),
++			})
+ 		}
+ 		if p.EncryptionLevel == protocol.Encryption1RTT {
+ 			acked1RTTPacket = true
+@@ -529,6 +551,11 @@
+ 		}
+ 	}
+ 
++	if cex, ok := h.getCongestionControl().(congestion.SendAlgorithmEx); ok &&
++		(len(h.ackedPacketsInfo) != 0 || len(h.lostPacketsInfo) != 0) {
++		cex.OnCongestionEventEx(priorInFlight, rcvTime, h.ackedPacketsInfo, h.lostPacketsInfo)
++	}
++
+ 	// After this point, we must not use ackedPackets any longer!
+ 	// We've already returned the buffers.
+ 	ackedPackets = nil    //nolint:ineffassign // This is just to be on the safe side.
+@@ -884,6 +911,7 @@
+ }
+ 
+ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protocol.EncryptionLevel) {
++	h.lostPacketsInfo = h.lostPacketsInfo[:0]
+ 	pnSpace := h.getPacketNumberSpace(encLevel.PacketNumberSpace())
+ 	pnSpace.lossTime = 0
+ 	space := encLevel.PacketNumberSpace()
+@@ -975,8 +1003,15 @@
+ 				// the bytes in flight need to be reduced no matter if the frames in this packet will be retransmitted
+ 				h.removeFromBytesInFlight(p)
+ 				h.queueFramesForRetransmission(p)
+-				if !p.IsPathMTUProbePacket {
+-					h.congestion.OnCongestionEvent(pn, p.Length, priorInFlight)
++				if cc := h.getCongestionControl(); !p.IsPathMTUProbePacket && controllerSees(cc, encLevel) {
++					cc.OnCongestionEvent(pn, p.Length, priorInFlight)
++					h.lostPacketsInfo = append(h.lostPacketsInfo, congestionExt.LostPacketInfo{
++						PacketNumber: congestionExt.PacketNumber(pn),
++						BytesLost:    congestionExt.ByteCount(p.Length),
++					})
++				} else if !p.IsPathMTUProbePacket {
++					h.connStats.PacketsLost.Add(1)
++					h.connStats.BytesLost.Add(uint64(p.Length))
+ 				}
+ 				if encLevel == protocol.Encryption1RTT && h.ecnTracker != nil {
+ 					h.ecnTracker.LostPacket(pn)
+@@ -1000,6 +1035,7 @@
+ 		h.detectLostPathProbes(now)
+ 	}
+ 
++	priorInFlight := h.bytesInFlight
+ 	earliestLossTime, encLevel := h.getLossTimeAndSpace()
+ 	if !earliestLossTime.IsZero() {
+ 		if h.logger.Debug() {
+@@ -1014,6 +1050,11 @@
+ 		}
+ 		// Early retransmit or time loss detection
+ 		h.detectLostPackets(now, encLevel)
++
++		if cex, ok := h.getCongestionControl().(congestion.SendAlgorithmEx); ok &&
++			len(h.lostPacketsInfo) != 0 {
++			cex.OnCongestionEventEx(priorInFlight, now, nil, h.lostPacketsInfo)
++		}
+ 		return nil
+ 	}
+ 
+@@ -1127,9 +1168,9 @@
+ 		return h.ptoMode
+ 	}
+ 	// Only send ACKs if we're congestion limited.
+-	if !h.congestion.CanSend(h.bytesInFlight) {
++	if !h.getCongestionControl().CanSend(h.bytesInFlight) {
+ 		if h.logger.Debug() {
+-			h.logger.Debugf("Congestion limited: bytes in flight %d, window %d", h.bytesInFlight, h.congestion.GetCongestionWindow())
++			h.logger.Debugf("Congestion limited: bytes in flight %d, window %d", h.bytesInFlight, h.getCongestionControl().GetCongestionWindow())
+ 		}
+ 		return SendAck
+ 	}
+@@ -1139,18 +1180,18 @@
+ 		}
+ 		return SendAck
+ 	}
+-	if !h.congestion.HasPacingBudget(now) {
++	if !h.getCongestionControl().HasPacingBudget(now) {
+ 		return SendPacingLimited
+ 	}
+ 	return SendAny
+ }
+ 
+ func (h *sentPacketHandler) TimeUntilSend() monotime.Time {
+-	return h.congestion.TimeUntilSend(h.bytesInFlight)
++	return h.getCongestionControl().TimeUntilSend(h.bytesInFlight)
+ }
+ 
+ func (h *sentPacketHandler) SetMaxDatagramSize(s protocol.ByteCount) {
+-	h.congestion.SetMaxDatagramSize(s)
++	h.getCongestionControl().SetMaxDatagramSize(s)
+ }
+ 
+ func (h *sentPacketHandler) isAmplificationLimited() bool {
+@@ -1194,6 +1235,7 @@
+ 
+ func (h *sentPacketHandler) ResetForRetry(now monotime.Time) {
+ 	h.bytesInFlight = 0
++	h.connStats.BytesInFlight.Store(0)
+ 	var firstPacketSendTime monotime.Time
+ 	// Only Initial and 0-RTT packets can have been sent before a Retry.
+ 	for _, p := range h.hist.Packets() {
+@@ -1257,14 +1299,68 @@
+ 	for pn := range h.hist.PathProbes() {
+ 		h.hist.RemovePathProbe(pn)
+ 	}
+-	h.congestion = congestion.NewCubicSender(
+-		congestion.DefaultClock{},
+-		h.rttStats,
+-		h.connStats,
+-		initialMaxDatagramSize,
+-		true, // use Reno
+-		h.qlogger,
+-	)
++	h.congestionMutex.Lock()
++	h.congestion = h.newCongestionControl(initialMaxDatagramSize)
++	h.congestionMutex.Unlock()
+ 	h.qlogRecoveryParametersSet(true)
+ 	h.setLossDetectionTimer(now)
++}
++
++// controllerSees reports whether a packet of this level goes to the congestion controller. A pluggable controller
++// indexes packets by number, and the Initial and Handshake spaces number their packets from 0 apart from the
++// application data space, so only the packets of that space reach it. The built-in sender sees them all.
++func controllerSees(cc congestion.SendAlgorithmWithDebugInfos, level protocol.EncryptionLevel) bool {
++	_, pluggable := cc.(interface{ pluggable() })
++	return !pluggable || level == protocol.Encryption1RTT || level == protocol.Encryption0RTT
++}
++
++func (h *sentPacketHandler) getCongestionControl() congestion.SendAlgorithmWithDebugInfos {
++	h.congestionMutex.RLock()
++	cc := h.congestion
++	h.congestionMutex.RUnlock()
++	return cc
++}
++
++// newCongestionControl builds the controller of a path: the one ccFactory builds, or the built-in one.
++// The caller holds congestionMutex.
++func (h *sentPacketHandler) newCongestionControl(initialMaxDatagramSize protocol.ByteCount) congestion.SendAlgorithmWithDebugInfos {
++	if h.ccFactory == nil {
++		return congestion.NewCubicSender(
++			congestion.DefaultClock{},
++			h.rttStats,
++			h.connStats,
++			initialMaxDatagramSize,
++			!h.cubic,
++			h.qlogger,
++		)
++	}
++	cc := h.ccFactory(congestionExt.ByteCount(initialMaxDatagramSize))
++	cc.SetRTTStatsProvider(h.rttStats)
++	a := &ccAdapter{cc, h.connStats}
++	a.updateStats()
++	if ex, ok := cc.(congestionExt.CongestionControlEx); ok {
++		return &ccAdapterEx{a, ex}
++	}
++	return a
++}
++
++func (h *sentPacketHandler) SetCongestionControlFactory(f func(congestionExt.ByteCount) congestionExt.CongestionControl, initialMaxDatagramSize protocol.ByteCount) {
++	h.congestionMutex.Lock()
++	h.ccFactory = f
++	h.congestion = h.newCongestionControl(initialMaxDatagramSize)
++	h.congestionMutex.Unlock()
++}
++
++func (h *sentPacketHandler) SetCubic(initialMaxDatagramSize protocol.ByteCount) {
++	h.congestionMutex.Lock()
++	h.cubic = true
++	h.congestion = h.newCongestionControl(initialMaxDatagramSize)
++	h.congestionMutex.Unlock()
++}
++
++func (h *sentPacketHandler) CongestionControlName() string {
++	if n, ok := h.getCongestionControl().(interface{ Name() string }); ok {
++		return n.Name()
++	}
++	return ""
+ }
+diff -ruN a/internal/congestion/cubic_sender.go b/internal/congestion/cubic_sender.go
+--- a/internal/congestion/cubic_sender.go
++++ b/internal/congestion/cubic_sender.go
+@@ -218,6 +218,14 @@
+ 	}
+ }
+ 
++// Name is "reno" or "cubic", the algorithm this sender runs.
++func (c *cubicSender) Name() string {
++	if c.reno {
++		return "reno"
++	}
++	return "cubic"
++}
++
+ func (c *cubicSender) OnCongestionEvent(packetNumber protocol.PacketNumber, lostBytes, priorInFlight protocol.ByteCount) {
+ 	c.connStats.PacketsLost.Add(1)
+ 	c.connStats.BytesLost.Add(uint64(lostBytes))
+diff -ruN a/internal/congestion/interface.go b/internal/congestion/interface.go
+--- a/internal/congestion/interface.go
++++ b/internal/congestion/interface.go
+@@ -1,6 +1,7 @@
+ package congestion
+ 
+ import (
++	"github.com/quic-go/quic-go/congestion"
+ 	"github.com/quic-go/quic-go/internal/monotime"
+ 	"github.com/quic-go/quic-go/internal/protocol"
+ )
+@@ -17,6 +18,11 @@
+ 	OnSpuriousLoss(number protocol.PacketNumber)
+ 	OnRetransmissionTimeout(packetsRetransmitted bool)
+ 	SetMaxDatagramSize(protocol.ByteCount)
++}
++
++type SendAlgorithmEx interface {
++	SendAlgorithm
++	OnCongestionEventEx(priorInFlight protocol.ByteCount, eventTime monotime.Time, ackedPackets []congestion.AckedPacketInfo, lostPackets []congestion.LostPacketInfo)
+ }
+ 
+ // A SendAlgorithmWithDebugInfos is a SendAlgorithm that exposes some debug infos
+diff -ruN a/internal/utils/connstats.go b/internal/utils/connstats.go
+--- a/internal/utils/connstats.go
++++ b/internal/utils/connstats.go
+@@ -6,6 +6,10 @@
+ // ConnectionStats struct in connection.go for more information
+ type ConnectionStats struct {
+ 	CongestionWindow atomic.Uint64
++	BytesInFlight    atomic.Uint64
++	// BandwidthEstimate is the bandwidth estimate of a controller that keeps one, in bytes per second.
++	BandwidthEstimate atomic.Uint64
++	PathChanges       atomic.Uint64
+ 
+ 	BytesSent       atomic.Uint64
+ 	PacketsSent     atomic.Uint64
+diff -ruN a/internal/utils/rtt_stats.go b/internal/utils/rtt_stats.go
+--- a/internal/utils/rtt_stats.go
++++ b/internal/utils/rtt_stats.go
+@@ -19,7 +19,7 @@
+ 
+ // RTTStats provides round-trip statistics
+ type RTTStats struct {
+-	hasMeasurement bool
++	hasMeasurement atomic.Bool
+ 
+ 	minRTT        atomic.Int64 // nanoseconds
+ 	latestRTT     atomic.Int64 // nanoseconds
+@@ -67,7 +67,7 @@
+ 
+ // PTO gets the probe timeout duration.
+ func (r *RTTStats) PTO(includeMaxAckDelay bool) time.Duration {
+-	if !r.hasMeasurement {
++	if !r.hasMeasurement.Load() {
+ 		return 2 * DefaultInitialRTT
+ 	}
+ 	pto := r.SmoothedRTT() + max(4*r.MeanDeviation(), protocol.TimerGranularity)
+@@ -88,7 +88,7 @@
+ 	// the client may cause a high ackDelay to result in underestimation of the
+ 	// r.minRTT.
+ 	minRTT := time.Duration(r.minRTT.Load())
+-	if !r.hasMeasurement || minRTT > sendDelta {
++	if !r.hasMeasurement.Load() || minRTT > sendDelta {
+ 		minRTT = sendDelta
+ 		r.minRTT.Store(sendDelta.Nanoseconds())
+ 	}
+@@ -102,8 +102,8 @@
+ 	}
+ 	r.latestRTT.Store(sample.Nanoseconds())
+ 	// First time call.
+-	if !r.hasMeasurement {
+-		r.hasMeasurement = true
++	if !r.hasMeasurement.Load() {
++		r.hasMeasurement.Store(true)
+ 		r.smoothedRTT.Store(sample.Nanoseconds())
+ 		r.meanDeviation.Store(sample.Nanoseconds() / 2)
+ 	} else {
+@@ -116,7 +116,7 @@
+ }
+ 
+ func (r *RTTStats) HasMeasurement() bool {
+-	return r.hasMeasurement
++	return r.hasMeasurement.Load()
+ }
+ 
+ // SetMaxAckDelay sets the max_ack_delay
+@@ -131,7 +131,7 @@
+ 	// we might already have obtained an RTT measurement.
+ 	// This can happen if we received the ClientHello in multiple pieces, and one of those pieces was lost.
+ 	// Discard the restored value. A fresh measurement is always better.
+-	if r.hasMeasurement {
++	if r.hasMeasurement.Load() {
+ 		return
+ 	}
+ 	r.smoothedRTT.Store(int64(t))
+@@ -139,7 +139,7 @@
+ }
+ 
+ func (r *RTTStats) ResetForPathMigration() {
+-	r.hasMeasurement = false
++	r.hasMeasurement.Store(false)
+ 	r.minRTT.Store(DefaultInitialRTT.Nanoseconds())
+ 	r.latestRTT.Store(DefaultInitialRTT.Nanoseconds())
+ 	r.smoothedRTT.Store(DefaultInitialRTT.Nanoseconds())
+@@ -149,7 +149,7 @@
+ 
+ func (r *RTTStats) Clone() *RTTStats {
+ 	out := &RTTStats{}
+-	out.hasMeasurement = r.hasMeasurement
++	out.hasMeasurement.Store(r.hasMeasurement.Load())
+ 	out.minRTT.Store(r.minRTT.Load())
+ 	out.latestRTT.Store(r.latestRTT.Load())
+ 	out.smoothedRTT.Store(r.smoothedRTT.Load())
+diff -ruN a/monotime/time.go b/monotime/time.go
+--- a/monotime/time.go
++++ b/monotime/time.go
+@@ -0,0 +1,10 @@
++// Package monotime exports the monotonic clock type of the connection.
++package monotime
++
++import "github.com/quic-go/quic-go/internal/monotime"
++
++// A Time is an instant of the monotonic clock.
++type Time = monotime.Time
++
++// Now returns the current monotonic time.
++func Now() Time { return monotime.Now() }
