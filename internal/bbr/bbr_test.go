@@ -31,17 +31,16 @@ func TestStartsInStartupWithTheInitialWindow(t *testing.T) {
 	}
 }
 
-// A datagram size is only ever raised by path MTU discovery; a smaller one must not crash the connection.
-func TestASmallerDatagramSizeIsIgnored(t *testing.T) {
+// Path MTU discovery raises the datagram size and a black hole brings it back to 1200: the windows counted in packets follow.
+func TestTheDatagramSizeScalesTheWindows(t *testing.T) {
 	b := newTestSender()
 	b.SetMaxDatagramSize(1452)
-	window := b.GetCongestionWindow()
-	if want := congestion.ByteCount(32 * 1452); window != want {
-		t.Fatalf("window after a larger datagram size %d, want %d", window, want)
+	if got, want := b.GetCongestionWindow(), congestion.ByteCount(32*1452); got != want {
+		t.Fatalf("window after a larger datagram size %d, want %d", got, want)
 	}
 	b.SetMaxDatagramSize(1200)
-	if got := b.GetCongestionWindow(); got != window || b.maxDatagramSize != 1452 {
-		t.Fatalf("window %d, size %d after a smaller size, want %d and 1452", got, b.maxDatagramSize, window)
+	if got, want := b.GetCongestionWindow(), congestion.ByteCount(32*1200); got != want || b.maxDatagramSize != 1200 || b.minCongestionWindow != 4*1200 {
+		t.Fatalf("window %d, size %d, minimum %d after a smaller size, want %d, 1200 and %d", got, b.maxDatagramSize, b.minCongestionWindow, want, 4*1200)
 	}
 }
 

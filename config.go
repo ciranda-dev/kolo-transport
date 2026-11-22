@@ -78,6 +78,8 @@ type Config struct {
 	Network string
 	// CongestionControl picks the controller that paces what this end sends: "reno" (the default), "cubic" or "bbr". "bbr" keeps a link full where random loss makes the others crawl, but takes the bandwidth of other flows and holds a standing queue (see the guide).
 	CongestionControl string
+	// Datagrams offers QUIC datagrams (RFC 9221) on Listen and Dial; Conn.SendDatagram and Conn.ReceiveDatagram work only when both ends offer them. Default false.
+	Datagrams bool
 }
 
 type limit[T int | int64 | time.Duration] struct {
@@ -238,7 +240,7 @@ func (c Config) quic() *quic.Config {
 		MaxIncomingStreams:             int64(c.MaxIncomingStreams),
 		MaxIncomingUniStreams:          int64(c.MaxIncomingStreams),
 		Allow0RTT:                      false,
-		EnableDatagrams:                false,
+		EnableDatagrams:                c.Datagrams,
 		InitialPacketSize:              initialPacketSize,
 	}
 }

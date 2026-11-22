@@ -11,6 +11,9 @@ type Stream struct {
 	s *quic.Stream
 }
 
+// ID returns the QUIC stream ID (RFC 9000 section 2.1), which both ends see alike.
+func (s *Stream) ID() uint64 { return uint64(s.s.StreamID()) }
+
 // Read reads data from the peer; it returns io.EOF after the peer closed its send side.
 func (s *Stream) Read(p []byte) (int, error) {
 	n, err := s.s.Read(p)

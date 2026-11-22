@@ -130,6 +130,10 @@ type sentPacketHandler struct {
 	// Only applies to the application-data packet number space.
 	numProbesToSend int
 
+	blackHoles    blackHoleDetector
+	blackHole     bool                  // reported by BlackHoleDetected
+	blackHoleFrom protocol.PacketNumber // packets sent before the last report do not count
+
 	// The alarm timeout
 	alarm alarmTimer
 
@@ -183,6 +187,7 @@ func NewSentPacketHandler(
 		handshakePackets:   newPacketNumberSpace(),
 		appDataPackets:     newPacketNumberSpace(),
 		lostPackets:        *newLostPacketTracker(),
+		blackHoles:         newBlackHoleDetector(),
 		rttStats:           rttStats,
 		connStats:          connStats,
 		congestion:         congestion,
@@ -480,6 +485,12 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 				h.largestAckedTime = p.SendTime
 			}
 			h.getCongestionControl().MaybeExitSlowStart()
+		}
+	}
+
+	for _, p := range ackedPackets {
+		if p.EncryptionLevel == protocol.Encryption1RTT && !p.isPathProbePacket {
+			h.blackHoles.acked(p.PacketNumber, p.Length, p.IsPathMTUProbePacket)
 		}
 	}
 
@@ -1002,6 +1013,9 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 			if !p.isPathProbePacket && p.IsAckEliciting() {
 				// the bytes in flight need to be reduced no matter if the frames in this packet will be retransmitted
 				h.removeFromBytesInFlight(p)
+				if space == protocol.PacketNumberSpaceAppData && !p.IsPathMTUProbePacket && pn >= h.blackHoleFrom {
+					h.blackHoles.lost(pn, p.Length)
+				}
 				h.queueFramesForRetransmission(p)
 				if cc := h.getCongestionControl(); !p.IsPathMTUProbePacket && controllerSees(cc, encLevel) {
 					cc.OnCongestionEvent(pn, p.Length, priorInFlight)
@@ -1018,6 +1032,9 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 				}
 			}
 		}
+	}
+	if space == protocol.PacketNumberSpaceAppData && h.blackHoles.detected() {
+		h.blackHole = true
 	}
 	if h.handshakeConfirmed && h.handshakePNs != nil {
 		firstPN := h.hist.FirstPacketNumber()
@@ -1108,10 +1125,34 @@ func (h *sentPacketHandler) OnLossDetectionTimeout(now monotime.Time) error {
 		pn := h.PopPacketNumber(protocol.PacketNumberSpaceAppData)
 		h.hist.SkippedPacket(pn)
 		h.ptoMode = SendPTOAppData
+		// Probe timeouts in a row with large packets outstanding are a full-stop timeout (RFC 4821 section 7.7).
+		if h.ptoCount >= blackHoleThreshold && h.largePacketOutstanding() {
+			h.blackHole = true
+		}
 	default:
 		return fmt.Errorf("PTO timer in unexpected encryption level: %s", encLevel)
 	}
 	return nil
+}
+
+func (h *sentPacketHandler) largePacketOutstanding() bool {
+	for pn, p := range h.hist.Packets() {
+		if pn >= h.blackHoleFrom && p.EncryptionLevel == protocol.Encryption1RTT && p.Outstanding() && p.Length > protocol.MinInitialPacketSize {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *sentPacketHandler) BlackHoleDetected() bool {
+	if !h.blackHole {
+		return false
+	}
+	// The packets in flight were sent at the old size: their losses say nothing about the new one.
+	h.blackHole = false
+	h.blackHoles = newBlackHoleDetector()
+	h.blackHoleFrom = h.appDataPackets.largestSent + 1
+	return true
 }
 
 func (h *sentPacketHandler) GetLossDetectionTimeout() monotime.Time {
@@ -1284,6 +1325,8 @@ func (h *sentPacketHandler) MigratedPath(now monotime.Time, initialMaxDatagramSi
 	h.timeThresholdEighths = defaultTimeThresholdEighths
 	h.minPNToRelaxReordering = protocol.InvalidPacketNumber
 	h.lostPackets.Reset()
+	h.blackHoles = newBlackHoleDetector()
+	h.blackHole = false
 	for pn, p := range h.hist.Packets() {
 		if p.EncryptionLevel.PacketNumberSpace() != protocol.PacketNumberSpaceAppData {
 			continue

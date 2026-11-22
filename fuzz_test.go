@@ -81,11 +81,11 @@ func FuzzMapError(f *testing.F) {
 }
 
 func FuzzConfig(f *testing.F) {
-	f.Add(0, 0, 0, 0, int64(0), int64(0), int64(0), int64(0), int64(0), int64(0), false, int64(0), int64(0), int64(0), "")
-	f.Add(1000, 9, 33, 1001, int64(time.Minute), int64(-1), int64(time.Second), int64(2<<30), int64(1<<20), int64(512<<10), true, int64(4<<20), int64(8<<20), int64(64<<20), "bbr")
-	f.Add(1, 1, 1, 1, int64(time.Second), int64(2*time.Second), int64(time.Second), int64(128<<20), int64(64<<10), int64(64<<20), true, int64(0), int64(0), int64(1<<20), "BBR")
-	f.Add(1, 1, 1, 1, int64(time.Second), int64(2*time.Second), int64(time.Second), int64(128<<20), int64(64<<10), int64(64<<20), false, int64(0), int64(0), int64(0), "cubic")
-	f.Fuzz(func(t *testing.T, conns, perIP, dialed, streams int, handshake, idle, keepAlive, memory, streamWin, connWin int64, grow bool, grownStream, grownConn, grownMem int64, cc string) {
+	f.Add(0, 0, 0, 0, int64(0), int64(0), int64(0), int64(0), int64(0), int64(0), false, int64(0), int64(0), int64(0), "", false)
+	f.Add(1000, 9, 33, 1001, int64(time.Minute), int64(-1), int64(time.Second), int64(2<<30), int64(1<<20), int64(512<<10), true, int64(4<<20), int64(8<<20), int64(64<<20), "bbr", true)
+	f.Add(1, 1, 1, 1, int64(time.Second), int64(2*time.Second), int64(time.Second), int64(128<<20), int64(64<<10), int64(64<<20), true, int64(0), int64(0), int64(1<<20), "BBR", false)
+	f.Add(1, 1, 1, 1, int64(time.Second), int64(2*time.Second), int64(time.Second), int64(128<<20), int64(64<<10), int64(64<<20), false, int64(0), int64(0), int64(0), "cubic", true)
+	f.Fuzz(func(t *testing.T, conns, perIP, dialed, streams int, handshake, idle, keepAlive, memory, streamWin, connWin int64, grow bool, grownStream, grownConn, grownMem int64, cc string, datagrams bool) {
 		c := Config{
 			MaxConns:               conns,
 			MaxDialed:              dialed,
@@ -104,6 +104,7 @@ func FuzzConfig(f *testing.F) {
 			MaxGrownMemory:              grownMem,
 
 			CongestionControl: cc,
+			Datagrams:         datagrams,
 		}
 		dialCfg, dialErr := c.withDefaults()
 		got, err := c.listenConfig()
@@ -142,7 +143,7 @@ func FuzzConfig(f *testing.F) {
 		if got.WindowGrowth {
 			wantStream, wantConn = got.MaxGrownStreamReceiveWindow, got.MaxGrownConnReceiveWindow
 		}
-		if q.Allow0RTT || q.HandshakeIdleTimeout <= 0 || q.KeepAlivePeriod != got.KeepAlivePeriod ||
+		if q.Allow0RTT || q.EnableDatagrams != datagrams || got.Datagrams != datagrams || q.HandshakeIdleTimeout <= 0 || q.KeepAlivePeriod != got.KeepAlivePeriod ||
 			q.MaxConnectionReceiveWindow != uint64(wantConn) || q.MaxStreamReceiveWindow != uint64(wantStream) ||
 			q.InitialConnectionReceiveWindow != uint64(got.MaxConnReceiveWindow) || q.InitialStreamReceiveWindow != uint64(got.MaxStreamReceiveWindow) {
 			t.Fatalf("bad quic config %+v", q)

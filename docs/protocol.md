@@ -8,7 +8,7 @@
 - Non-QUIC datagrams are capped at 1200 bytes, the size QUIC starts with, so they fit any path QUIC works on.
 - `Conn.Context` wraps quic-go's connection context and maps its cause, so no quic-go error or peer text escapes through `context.Cause`.
 - Bidirectional streams for request and reply, unidirectional ones for one-way data; streams carry raw bytes.
-- Datagrams are not exposed: unreliable messages need their own size, queue and rate limits.
+- QUIC datagrams (RFC 9221) are off unless both ends set `Config.Datagrams`. quic-go bounds their queues (128 received, 32 to send, per connection); `SendDatagram` never blocks and drops a datagram when the send queue is full, and a datagram must fit in one packet on the current path.
 - Keep-alive is always on. quic-go sends a PING after min(`KeepAlivePeriod`, idle timeout / 2) without receiving anything, raised to at least 1.5 times the probe timeout. A connection stays open while the peer answers and ends after the idle timeout once the peer or the path is gone. Close connections you no longer need, and accept the ones that arrive. Each side's idle timeout is min(own `IdleTimeout`, max(peer's `IdleTimeout`, 5s)), because quic-go raises the peer's value to at least 5s (`connection.go`), so below 5s the two sides can time out at different moments.
 - `HandshakeTimeout` bounds the whole handshake; `IdleTimeout` applies after it.
 - Every limit has a default and a hard maximum, checked before anything is opened. The receive windows are advanced options with small defaults (256 KiB per stream, 512 KiB per connection), and `MaxIncomingStreams` defaults to 16, because with 1-byte frames each unread byte costs about 176 bytes of heap and each byte read on a stream still open keeps about 96 (measured); `MaxMemory` checks that `MaxConns` plus `MaxDialed` connections fit.
@@ -35,7 +35,7 @@ the application's bytes; there is no JSON form.
 
 - [RFC 9000, QUIC: A UDP-Based Multiplexed and Secure Transport](https://www.rfc-editor.org/info/rfc9000) (Proposed Standard, May 2021).
   Takes: QUIC version 1, Retry on every new connection (8.1.2), 1200-byte first packets (14), stream and error-code semantics.
-  Not implemented: 0-RTT, session resumption, QUIC version 2 (RFC 9369), unreliable datagrams (RFC 9221).
+  Not implemented: 0-RTT, session resumption, QUIC version 2 (RFC 9369).
 - [RFC 9001, Using TLS to Secure QUIC](https://www.rfc-editor.org/info/rfc9001) (Proposed Standard, May 2021).
   Takes: the TLS 1.3 handshake inside QUIC, ALPN `kolo/0`.
   Not implemented: session tickets, early data.
@@ -50,7 +50,13 @@ the application's bytes; there is no JSON form.
 - Cardwell, Cheng, Gunn, Hassas Yeganeh and Jacobson, [BBR: Congestion-Based Congestion Control](https://doi.org/10.1145/3012426.3022184), ACM Queue 14(5), 2016.
   Takes: the opt-in `"bbr"` controller: bottleneck bandwidth and round-trip estimates, pacing.
   Not implemented: BBRv3 of [draft-ietf-ccwg-bbr](https://datatracker.ietf.org/doc/html/draft-ietf-ccwg-bbr-07); loss is not a signal.
+- [RFC 9221, An Unreliable Datagram Extension to QUIC](https://www.rfc-editor.org/info/rfc9221) (Proposed Standard, March 2022).
+  Takes: DATAGRAM frames and the max_datagram_frame_size transport parameter (3), opt-in through `Config.Datagrams`; datagrams the sender cannot queue are dropped (5.1).
+  Not implemented: datagrams in 0-RTT packets, since 0-RTT is off.
 - [RFC 8899, Packetization Layer Path MTU Discovery for Datagram Transports](https://www.rfc-editor.org/info/rfc8899) (Proposed Standard, September 2020).
-  Takes: path MTU discovery above 1200 bytes.
+  Takes: path MTU discovery above 1200 bytes; black hole detection from the loss of large packets (4.3) with MAX_PROBES 3 (5.1.2), and the fall back to a BASE_PLPMTU of 1200 bytes, from which the search starts again (5.2).
+  Not implemented: ICMP Packet Too Big messages (4.6), which quic-go does not read; the ERROR state (5.2): QUIC needs 1200 bytes on every path (RFC 9000 section 14), so a path that no longer carries them stalls the data, and while its small packets still pass the connection stays open (an app needs its own time limit); the PMTU_RAISE_TIMER (5.1.1): once a search ends, the size is not probed again until a black hole or a new path.
+- [RFC 4821, Packetization Layer Path MTU Discovery](https://www.rfc-editor.org/info/rfc4821), section 7.7 (Proposed Standard, March 2007).
+  Takes: the full-stop timeout as a black hole indication: 3 probe timeouts in a row with packets larger than 1200 bytes outstanding.
 - [RFC 9846, The Transport Layer Security (TLS) Protocol Version 1.3](https://www.rfc-editor.org/info/rfc9846), section 7.5 (Proposed Standard, July 2026; obsoletes RFC 8446).
   Takes: the exporter behind `Conn.ExportKey`.

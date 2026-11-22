@@ -95,12 +95,14 @@ hello kolo
 | `Conn.OpenStream`, `Conn.OpenUniStream` | Open a bidirectional or unidirectional stream |
 | `Conn.AcceptStream`, `Conn.AcceptUniStream` | Wait for the peer's next stream |
 | `Conn.Stats` | Round-trip times, bytes, losses, congestion window, controller and path of the connection (zero after it ends) |
+| `Conn.SupportsDatagrams`, `Conn.SendDatagram`, `Conn.ReceiveDatagram` | Send and receive QUIC datagrams (RFC 9221) when both ends set `Config.Datagrams`; a send never blocks and drops when the queue is full |
+| `Stream.ID` | The QUIC stream ID (RFC 9000 section 2.1), the same on both ends |
 | `Conn.ExportKey` | Derive 32 bytes from the TLS session (RFC 9846 exporter) for a higher layer to sign |
 | `Conn.Close`, `Conn.CloseWithError` | Close with code 0, or with a code and a message |
 | `Listener.WritePacket`, `Listener.ReadPacket` | Send and receive small non-QUIC datagrams on the listener's socket, for hole punching |
-| `Config` | Limits on connections, streams, memory and timeouts, and the congestion controller; a nil or zero field means the default |
+| `Config` | Limits on connections, streams, memory and timeouts, the congestion controller and datagrams; a nil or zero field means the default |
 
-Errors are sentinels for `errors.Is` (`ErrPeerClosed`, `ErrClosed`, `ErrRefused`, `ErrHandshake`, `ErrTimeout`, `ErrStreamReset`, `ErrStreamCanceled`, `ErrTransport`, `ErrMaxDialed`, `ErrInvalidConfig`, `ErrInvalidArgument`); those with a code are an `*Error`.
+Errors are sentinels for `errors.Is` (`ErrPeerClosed`, `ErrClosed`, `ErrRefused`, `ErrHandshake`, `ErrTimeout`, `ErrStreamReset`, `ErrStreamCanceled`, `ErrTransport`, `ErrMaxDialed`, `ErrDatagramsUnsupported`, `ErrDatagramTooLarge`, `ErrDatagramDropped`, `ErrInvalidConfig`, `ErrInvalidArgument`); those with a code are an `*Error`.
 
 ## Documentation
 

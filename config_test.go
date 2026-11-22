@@ -75,6 +75,7 @@ func TestConfigKeepsValidValues(t *testing.T) {
 			MaxConnReceiveWindow:   64 << 10,
 			Network:                "udp4",
 			CongestionControl:      "bbr",
+			Datagrams:              true,
 		},
 		{
 			MaxConns:           1,
@@ -103,7 +104,8 @@ func TestConfigKeepsValidValues(t *testing.T) {
 		q := got.quic()
 		if q.KeepAlivePeriod != got.KeepAlivePeriod || q.MaxIncomingUniStreams != int64(got.MaxIncomingStreams) ||
 			q.InitialStreamReceiveWindow != uint64(got.MaxStreamReceiveWindow) || q.MaxStreamReceiveWindow != uint64(got.MaxStreamReceiveWindow) ||
-			q.InitialConnectionReceiveWindow != uint64(got.MaxConnReceiveWindow) || q.MaxConnectionReceiveWindow != uint64(got.MaxConnReceiveWindow) {
+			q.InitialConnectionReceiveWindow != uint64(got.MaxConnReceiveWindow) || q.MaxConnectionReceiveWindow != uint64(got.MaxConnReceiveWindow) ||
+			q.EnableDatagrams != in.Datagrams {
 			t.Fatalf("quic config %+v", got.quic())
 		}
 	}

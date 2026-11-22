@@ -41,7 +41,7 @@ type ConnStats struct {
 	// rate of the last ten round trips. Only "bbr" measures it; it is 0 for "reno" and "cubic" and before the first sample.
 	BandwidthEstimate uint64
 	// MaxDatagramSize is the largest UDP payload in bytes this end sends on the current path. It starts at the
-	// initial size and grows as path MTU discovery succeeds.
+	// initial size, grows as path MTU discovery succeeds and falls back to 1200 when losses show the path carries less.
 	MaxDatagramSize uint64
 	// PathChanges counts how often the connection moved to a new network path, for example when the peer's NAT gave it a new port.
 	// The RTT fields, the congestion window and BandwidthEstimate start over on a new path.

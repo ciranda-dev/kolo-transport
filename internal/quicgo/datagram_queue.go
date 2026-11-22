@@ -81,6 +81,26 @@ func (h *datagramQueue) Add(f *wire.DatagramFrame) error {
 	}
 }
 
+// TryAdd queues a new DATAGRAM frame for sending, like Add,
+// but returns false instead of blocking when the queue is full.
+func (h *datagramQueue) TryAdd(f *wire.DatagramFrame) (bool, error) {
+	h.sendMx.Lock()
+	select {
+	case <-h.closed:
+		h.sendMx.Unlock()
+		return false, h.closeErr
+	default:
+	}
+	if h.sendQueue.Len() >= maxDatagramSendQueueLen {
+		h.sendMx.Unlock()
+		return false, nil
+	}
+	h.sendQueue.PushBack(f)
+	h.sendMx.Unlock()
+	h.hasData()
+	return true, nil
+}
+
 // Peek gets the next DATAGRAM frame for sending.
 // If actually sent out, Pop needs to be called before the next call to Peek.
 func (h *datagramQueue) Peek() *wire.DatagramFrame {
