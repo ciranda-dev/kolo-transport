@@ -9,9 +9,9 @@ Every option, default and bound of kolo-transport, with the reason for it. A val
 
 | Option | Default | Range | Why |
 |---|---|---|---|
-| `MaxConns` (per listener, handshaking or open) | 100 | 1 to 10000 | Security: bounds the state a flood from many addresses makes a public node hold |
+| `MaxConns` (per listener, handshaking or open) | 100 | at least 1; `MaxMemory` is the upper bound | Security: bounds the state a flood from many addresses makes a public node hold. The `MaxMemory` check (below) is what protects memory, so there is no separate maximum; raise `MaxMemory` with it. |
 | `MaxConnsPerIP` (per listener and source address) | 4, or `MaxConns` if lower | 1 to `MaxConns` | Security: stops one address from holding every slot |
-| `MaxDialed` (connections open from `Listener.Dial`) | 32 | 1 to 10000 | Memory: bounds the unread data dialed connections can make this node hold |
+| `MaxDialed` (connections open from `Listener.Dial`) | 32 | at least 1; `MaxMemory` is the upper bound | Memory: bounds the unread data dialed connections can make this node hold, through the same `MaxMemory` check as `MaxConns` |
 | `MaxIncomingStreams` (concurrent, per connection, bidirectional and unidirectional each) | 16 | 1 to 1000 | Measured: quic-go keeps about 96 heap bytes per byte read on an open stream, so the worst case per connection is about 856 MiB at 16 and 4.8 GiB at 100 (see below) |
 | `HandshakeTimeout` (also the life of a Retry token) | 10s | 1s to 60s | Security: a stalled handshake holds a `MaxConns` slot until it expires |
 | `IdleTimeout` | 30s | 1s to 10m | Memory: ends a connection, and frees its slot, once the peer or the path is gone |
@@ -106,6 +106,8 @@ message naming the ways out, such as "(MaxConns 1000 + MaxDialed 32) ×
 MaxConnReceiveWindow 512 KiB needs 516 MiB of receive window, above
 MaxMemory 256 MiB; raise MaxMemory or lower MaxConns, MaxDialed or
 MaxConnReceiveWindow". The 64 GiB maximum is a sanity limit.
+
+`MaxConns` and `MaxDialed` have no maximum of their own. To hold more connections, raise `MaxMemory` with them: the check allows `MaxConns` + `MaxDialed` up to `MaxMemory` / `MaxConnReceiveWindow`, which is 2048 at the defaults and about 1 million at 64 GiB with 64 KiB windows.
 
 Small windows limit throughput to about window / RTT: at 100 ms, the
 defaults allow about 40 Mbit/s per connection and 20 Mbit/s per stream.

@@ -2,6 +2,7 @@ package kolotransport
 
 import (
 	"fmt"
+	"math"
 	"net/netip"
 	"time"
 
@@ -42,11 +43,11 @@ var defaultCongestionControl = congestionReno
 
 // Config sets the limits of a Listener or a dialed Conn. A zero field takes its default. Config is not comparable.
 type Config struct {
-	// MaxConns caps the connections of a Listener, handshaking or open. Listener only. Default 100, from 1 to 10000.
+	// MaxConns caps the connections of a Listener, handshaking or open. Listener only. Default 100, at least 1; MaxMemory is the upper bound.
 	MaxConns int
 	// MaxConnsPerIP caps them per source address, the one a connection started from. Listener only. Default 4 (or MaxConns if lower), at most MaxConns.
 	MaxConnsPerIP int
-	// MaxDialed caps the connections Listener.Dial has open, which MaxConns and MaxConnsPerIP do not count. Listener only. Default 32, from 1 to 10000.
+	// MaxDialed caps the connections Listener.Dial has open, which MaxConns and MaxConnsPerIP do not count. Listener only. Default 32, at least 1; MaxMemory is the upper bound.
 	MaxDialed int
 	// MaxIncomingStreams caps the concurrent streams the peer may open, bidirectional and unidirectional each. Default 16, from 1 to 1000.
 	MaxIncomingStreams int
@@ -88,8 +89,6 @@ type limit[T int | int64 | time.Duration] struct {
 }
 
 var (
-	limitConns     = limit[int]{"MaxConns", 100, 1, 10000}
-	limitDialed    = limit[int]{"MaxDialed", 32, 1, 10000}
 	limitMemory    = limit[int64]{"MaxMemory", DefaultMaxMemory, 64 << 20, 64 << 30}
 	limitStreams   = limit[int]{"MaxIncomingStreams", 16, 1, 1000}
 	limitHandshake = limit[time.Duration]{"HandshakeTimeout", 10 * time.Second, time.Second, time.Minute}
@@ -105,6 +104,16 @@ func (l limit[T]) apply(v *T) error {
 		*v = l.def
 	case *v < l.min || *v > l.max:
 		return fmt.Errorf("%w: %s must be between %v and %v", ErrInvalidConfig, l.name, l.min, l.max)
+	}
+	return nil
+}
+
+func applyCount(name string, v *int, def int) error {
+	switch {
+	case *v == 0:
+		*v = def
+	case *v < 0:
+		return fmt.Errorf("%w: %s must be at least 1", ErrInvalidConfig, name)
 	}
 	return nil
 }
@@ -183,19 +192,20 @@ func (c *Config) listenConfig() (Config, error) {
 	if out.Network != "udp4" {
 		return Config{}, fmt.Errorf("%w: Network must be \"udp4\", not %q; IPv6 is refused", ErrInvalidConfig, out.Network)
 	}
-	if err := limitConns.apply(&out.MaxConns); err != nil {
+	if err := applyCount("MaxConns", &out.MaxConns, 100); err != nil {
 		return Config{}, err
 	}
 	if err := (limit[int]{"MaxConnsPerIP", min(4, out.MaxConns), 1, out.MaxConns}).apply(&out.MaxConnsPerIP); err != nil {
 		return Config{}, err
 	}
-	if err := limitDialed.apply(&out.MaxDialed); err != nil {
+	if err := applyCount("MaxDialed", &out.MaxDialed, 32); err != nil {
 		return Config{}, err
 	}
 	if err := limitMemory.apply(&out.MaxMemory); err != nil {
 		return Config{}, err
 	}
-	conns := int64(out.MaxConns + out.MaxDialed)
+	// Even 1<<31 connections of 64 KiB need 128 TiB, above any MaxMemory, so clamping there keeps the products below from overflowing.
+	conns := min(int64(out.MaxConns), math.MaxInt32) + min(int64(out.MaxDialed), math.MaxInt32)
 	need := conns * out.MaxConnReceiveWindow
 	var grown int64
 	if out.WindowGrowth {

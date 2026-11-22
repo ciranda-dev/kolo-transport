@@ -413,6 +413,9 @@ func unmap(ap netip.AddrPort) netip.AddrPort {
 	return netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port())
 }
 
+// MaxConns returns the connection cap of the listener, with the default applied.
+func (l *Listener) MaxConns() int { return l.max }
+
 // Addr returns the local address of the listener.
 func (l *Listener) Addr() net.Addr { return l.pc.LocalAddr() }
 

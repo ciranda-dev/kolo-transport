@@ -236,6 +236,16 @@ func TestListenerCloseClosesDialed(t *testing.T) {
 	}
 }
 
+func TestListenerMaxConns(t *testing.T) {
+	checkGoroutines(t)
+	if n := listen(t, nil).MaxConns(); n != 100 {
+		t.Fatalf("default: %d", n)
+	}
+	if n := listen(t, &Config{MaxConns: 7}).MaxConns(); n != 7 {
+		t.Fatalf("set: %d", n)
+	}
+}
+
 func TestListenerDialLimit(t *testing.T) {
 	checkGoroutines(t)
 	a, b := listen(t, &Config{MaxDialed: 1}), listen(t, nil)

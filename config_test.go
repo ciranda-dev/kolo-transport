@@ -3,7 +3,9 @@ package kolotransport
 import (
 	"context"
 	"errors"
+	"math"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -62,9 +64,9 @@ func TestConfigDefaults(t *testing.T) {
 func TestConfigKeepsValidValues(t *testing.T) {
 	for _, in := range []Config{
 		{
-			MaxConns:           10000,
-			MaxConnsPerIP:      10000,
-			MaxDialed:          10000,
+			MaxConns:           20000,
+			MaxConnsPerIP:      20000,
+			MaxDialed:          20000,
 			MaxMemory:          64 << 30,
 			MaxIncomingStreams: 1,
 			HandshakeTimeout:   time.Second,
@@ -117,7 +119,6 @@ func TestConfigKeepsValidValues(t *testing.T) {
 func TestConfigRejectsOutOfRange(t *testing.T) {
 	for name, c := range map[string]Config{
 		"negative conns":        {MaxConns: -1},
-		"too many conns":        {MaxConns: 10001},
 		"conns over memory":     {MaxConns: 2049},
 		"conn window memory":    {MaxConns: 100, MaxConnReceiveWindow: 16 << 20},
 		"tiny stream window":    {MaxStreamReceiveWindow: 64<<10 - 1},
@@ -201,6 +202,23 @@ func TestMaxMemory(t *testing.T) {
 	}
 	if _, err := (&Config{MaxConns: 96, MaxMemory: 64 << 20}).listenConfig(); err != nil {
 		t.Fatalf("96 + 32 conns in 64 MiB: %v", err)
+	}
+}
+
+func TestCountsHaveNoRangeMaximum(t *testing.T) {
+	got, err := (&Config{MaxConns: 50000, MaxDialed: 20000, MaxConnReceiveWindow: 64 << 10, MaxMemory: 8 << 30}).listenConfig()
+	if err != nil || got.MaxConns != 50000 || got.MaxDialed != 20000 {
+		t.Fatalf("got %+v, %v", got, err)
+	}
+	// The sum of two counts near math.MaxInt must not wrap around the memory check.
+	_, err = (&Config{MaxConns: math.MaxInt, MaxDialed: math.MaxInt}).listenConfig()
+	if !errors.Is(err, ErrInvalidConfig) || !strings.Contains(err.Error(), "above MaxMemory 1024 MiB") {
+		t.Fatalf("got %v", err)
+	}
+	for _, c := range []Config{{MaxConns: -1}, {MaxDialed: -1}} {
+		if _, err := c.listenConfig(); !errors.Is(err, ErrInvalidConfig) {
+			t.Errorf("%+v: got %v", c, err)
+		}
 	}
 }
 
