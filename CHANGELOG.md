@@ -10,6 +10,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 ### Changed
 
 - **Breaking:** `Config.MaxConns` and `Config.MaxDialed` no longer have a range maximum of 10000: a value above 10000 that fits `MaxMemory` is now accepted, where it returned `ErrInvalidConfig`. The `MaxMemory` check of (`MaxConns` + `MaxDialed`) × `MaxConnReceiveWindow` is the upper bound, and a value below 1 is still invalid.
+- **Breaking:** with `Config.Datagrams` on, the `MaxMemory` check also counts 240 KiB of datagram queues (128 received and 32 to send, 1536 bytes each) for each of `MaxConns` + `MaxDialed`, so a listener whose datagram queues do not fit `MaxMemory` now returns `ErrInvalidConfig`, where it was accepted. Raise `MaxMemory`, lower the counts, or turn `Datagrams` off. Datagrams stay opt-in, so a config without them is unchanged.
 
 ### Added
 
