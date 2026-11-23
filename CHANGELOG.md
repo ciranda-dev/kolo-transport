@@ -11,9 +11,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 - **Breaking:** `Config.MaxConns` and `Config.MaxDialed` no longer have a range maximum of 10000: a value above 10000 that fits `MaxMemory` is now accepted, where it returned `ErrInvalidConfig`. The `MaxMemory` check of (`MaxConns` + `MaxDialed`) × `MaxConnReceiveWindow` is the upper bound, and a value below 1 is still invalid.
 - **Breaking:** with `Config.Datagrams` on, the `MaxMemory` check also counts 240 KiB of datagram queues (128 received and 32 to send, 1536 bytes each) for each of `MaxConns` + `MaxDialed`, so a listener whose datagram queues do not fit `MaxMemory` now returns `ErrInvalidConfig`, where it was accepted. Raise `MaxMemory`, lower the counts, or turn `Datagrams` off. Datagrams stay opt-in, so a config without them is unchanged.
+- **Breaking:** `Config.MaxMemory` and `Config.MaxGrownMemory` no longer have a range maximum of 64 GiB: a larger value is accepted, where it returned `ErrInvalidConfig`. The `MaxMemory` check is now computed without overflow at any count, and a configuration whose sum does not fit an `int64` is `ErrInvalidConfig`. The minimums (64 MiB and 1 MiB) stay.
 
 ### Added
 
+- `DefaultMaxConns` (100), `DefaultMaxDialed` (32) and `DatagramQueueBytes` (240 KiB, what the `MaxMemory` check counts per connection with `Datagrams`), so libraries that size a listener do not copy them.
 - `Listener.MaxConns` returns the connection cap of the listener, with the default applied.
 - `Config.Datagrams` (default false) offers QUIC datagrams (RFC 9221); `Conn.SupportsDatagrams` reports whether both ends offered them.
 - `Conn.SendDatagram`, which never blocks: a payload that does not fit in one packet on the current path is `ErrDatagramTooLarge`, and a full send queue (32) drops it with `ErrDatagramDropped`. `Conn.ReceiveDatagram` returns the next datagram (quic-go keeps up to 128). A datagram call on a connection without support is `ErrDatagramsUnsupported`.
