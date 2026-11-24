@@ -205,6 +205,32 @@ func TestMaxMemory(t *testing.T) {
 	}
 }
 
+func TestMaxMemoryCountsDatagramQueues(t *testing.T) {
+	// 96 + 32 conns of 512 KiB fill 64 MiB, so the datagram queues of 240 KiB each need 30 MiB more.
+	base := Config{MaxConns: 96, MaxMemory: 64 << 20}
+	if _, err := base.listenConfig(); err != nil {
+		t.Fatalf("without datagrams: %v", err)
+	}
+	base.Datagrams = true
+	_, err := base.listenConfig()
+	const want = "kolotransport: invalid config: (MaxConns 96 + MaxDialed 32) × MaxConnReceiveWindow 512 KiB plus datagram queues of 30 MiB needs 94 MiB of memory, above MaxMemory 64 MiB; raise MaxMemory, lower MaxConns, MaxDialed or MaxConnReceiveWindow, or turn off Datagrams"
+	if !errors.Is(err, ErrInvalidConfig) || err.Error() != want {
+		t.Fatalf("got %v", err)
+	}
+	base.MaxMemory = 94<<20 - 1
+	if _, err := base.listenConfig(); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("one byte short: %v", err)
+	}
+	base.MaxMemory = 94 << 20
+	if _, err := base.listenConfig(); err != nil {
+		t.Fatalf("exact fit: %v", err)
+	}
+	grown := Config{MaxConns: 96, MaxMemory: 94 << 20, Datagrams: true, WindowGrowth: true}
+	if _, err := grown.listenConfig(); !errors.Is(err, ErrInvalidConfig) || !strings.Contains(err.Error(), "plus window growth of up to 64 MiB plus datagram queues of 30 MiB") {
+		t.Fatalf("with growth: %v", err)
+	}
+}
+
 func TestCountsHaveNoRangeMaximum(t *testing.T) {
 	got, err := (&Config{MaxConns: 50000, MaxDialed: 20000, MaxConnReceiveWindow: 64 << 10, MaxMemory: 8 << 30}).listenConfig()
 	if err != nil || got.MaxConns != 50000 || got.MaxDialed != 20000 {

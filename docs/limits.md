@@ -16,7 +16,7 @@ Every option, default and bound of kolo-transport, with the reason for it. A val
 | `HandshakeTimeout` (also the life of a Retry token) | 10s | 1s to 60s | Security: a stalled handshake holds a `MaxConns` slot until it expires |
 | `IdleTimeout` | 30s | 1s to 10m | Memory: ends a connection, and frees its slot, once the peer or the path is gone |
 | `KeepAlivePeriod` (always on) | 5s, or `IdleTimeout`/2 if lower | 500ms to below `IdleTimeout` | Protocol: keeps a connection open while the peer answers; the minimum is 500ms so that the default fits a 1s `IdleTimeout` |
-| `MaxMemory` (must cover (`MaxConns` + `MaxDialed`) × `MaxConnReceiveWindow`, bytes; unread data, not heap) | 1 GiB (`DefaultMaxMemory`) | 64 MiB to 64 GiB | Memory: checks that the windows of every connection fit |
+| `MaxMemory` (must cover (`MaxConns` + `MaxDialed`) × `MaxConnReceiveWindow`, plus 240 KiB of datagram queues per connection when `Datagrams` is on, bytes; unread data and queues, not heap) | 1 GiB (`DefaultMaxMemory`) | 64 MiB to 64 GiB | Memory: checks that the windows, and the datagram queues, of every connection fit |
 | `AcceptFunc` (source IP filter) | nil (allow all) | any `func(netip.AddrPort) bool` | Security: refuses source IPs before an attempt takes a slot or any connection state |
 | `MaxStreamReceiveWindow` (advanced; unread bytes per stream) | 256 KiB (`DefaultMaxStreamReceiveWindow`) | 64 KiB to 16 MiB | Measured: about 176 heap bytes per unread byte and 96 per byte read on an open stream, with 1-byte frames (see below) |
 | `MaxConnReceiveWindow` (advanced; unread bytes per connection) | 512 KiB (`DefaultMaxConnReceiveWindow`) | 64 KiB to 64 MiB, at least `MaxStreamReceiveWindow` | Measured: the same heap factors, for the unread data of one connection |
@@ -34,7 +34,7 @@ Every option, default and bound of kolo-transport, with the reason for it. A val
 | Path MTU black hole detection (fixed) | more than 3 suspicious loss bursts, or 3 probe timeouts in a row | fixed | Protocol: MAX_PROBES of RFC 8899 section 5.1.2; the packet size falls back to 1200 bytes (RFC 9000 section 14.1) and the search starts again (see "Packet size" in [guide.md](guide.md#packet-size)) |
 | `MaxPacketSize` (non-QUIC datagram) | 1200 bytes | fixed | Protocol: the 1200 bytes QUIC starts with, so it fits any path QUIC works on |
 | Read buffer (fixed in quic-go) | 1452 bytes | fixed | Protocol: fixed by quic-go (internal/protocol/protocol.go:111) |
-| Datagram queues (fixed in quic-go; only on a connection whose ends both set `Datagrams`) | 128 received and 32 queued to send, per connection | fixed | Memory: fixed by quic-go (datagram_queue.go:15-16); each datagram is at most one packet of 1452 bytes, so a connection holds at most 160 × 1452 bytes (227 KiB), about 240 KiB of heap since Go rounds each buffer up to 1536 bytes; `MaxMemory` does not count it |
+| Datagram queues (fixed in quic-go; only on a connection whose ends both set `Datagrams`) | 128 received and 32 queued to send, per connection | fixed | Memory: fixed by quic-go (datagram_queue.go:15-16); each datagram is at most one packet of 1452 bytes, so a connection holds at most 160 × 1452 bytes (227 KiB), 240 KiB of heap since Go rounds each buffer up to 1536 bytes (160 × 1536); the `MaxMemory` check counts 240 KiB per connection when `Datagrams` is on (see below) |
 | `CloseWithError` message | 256 bytes | 0 to 256 | Protocol: 256 bytes always fit one packet; peers drop the text (see Errors in [guide.md](guide.md#errors)) |
 | `Listener.Close` fallback (fixed) | 1s | fixed | Protocol: closes a `PacketConn` that ignores read deadlines (see [Caller-supplied sockets](guide.md#caller-supplied-sockets)) |
 
@@ -99,7 +99,13 @@ With `WindowGrowth` on, the check adds the growth the connections can hold,
 the smaller of `MaxGrownMemory` and (`MaxConns` + `MaxDialed`) ×
 (`MaxGrownConnReceiveWindow` - `MaxConnReceiveWindow`).
 
-The defaults need 66 MiB of the 1 GiB: the default `MaxMemory` leaves
+With `Datagrams` on, the check also adds 240 KiB for each of the `MaxConns` + `MaxDialed` connections, the worst case of their datagram queues:
+
+    (MaxConns + MaxDialed) × (MaxConnReceiveWindow + 240 KiB) ≤ MaxMemory
+
+Measured with a receiver that never reads (loopback, heap after GC; Apple M5, Go 1.27): 128 queued datagrams of 1399 bytes held 159 KiB (1269 bytes each). The 240 KiB is the worst case, every buffer in the 1536-byte size class of a full packet, and the 32 datagrams of the send queue are counted at the same size (computed, not measured: the queue drains as fast as the path allows). Turning `Datagrams` on adds 31 MiB to the default check (132 connections), and the 128 connections that fit 64 MiB of windows need 94 MiB. To fit more connections, raise `MaxMemory` by 240 KiB per connection or turn `Datagrams` off.
+
+The defaults need 66 MiB of the 1 GiB (97 MiB with `Datagrams`): the default `MaxMemory` leaves
 headroom for raising `MaxConns` or the windows, and does not by itself
 bound the heap. Otherwise `Listen` returns `ErrInvalidConfig` with a
 message naming the ways out, such as "(MaxConns 1000 + MaxDialed 32) ×
@@ -107,7 +113,7 @@ MaxConnReceiveWindow 512 KiB needs 516 MiB of receive window, above
 MaxMemory 256 MiB; raise MaxMemory or lower MaxConns, MaxDialed or
 MaxConnReceiveWindow". The 64 GiB maximum is a sanity limit.
 
-`MaxConns` and `MaxDialed` have no maximum of their own. To hold more connections, raise `MaxMemory` with them: the check allows `MaxConns` + `MaxDialed` up to `MaxMemory` / `MaxConnReceiveWindow`, which is 2048 at the defaults and about 1 million at 64 GiB with 64 KiB windows.
+`MaxConns` and `MaxDialed` have no maximum of their own. To hold more connections, raise `MaxMemory` with them: the check allows `MaxConns` + `MaxDialed` up to `MaxMemory` / `MaxConnReceiveWindow`, which is 2048 at the defaults and about 1 million at 64 GiB with 64 KiB windows (about 221 thousand with `Datagrams`, whose queues add 240 KiB per connection).
 
 Small windows limit throughput to about window / RTT: at 100 ms, the
 defaults allow about 40 Mbit/s per connection and 20 Mbit/s per stream.
@@ -144,7 +150,7 @@ separately. At the defaults that is 2 × 16 × 256 KiB × 96 = 768 MiB plus
 512 KiB × 176 = 88 MiB, about 856 MiB per connection, about 3.3 GiB per
 source address (4 connections) and about 84 GiB for all 100 connections
 (25 addresses), plus about 27 GiB for the 32 connections `Listener.Dial`
-may open. A connection with datagrams adds its datagram queues, about 240 KiB (see the table above). With the default windows, one connection's worst case is
+may open. A connection with datagrams adds its datagram queues, 240 KiB, which the `MaxMemory` check counts (see above). With the default windows, one connection's worst case is
 856 MiB with 16 streams, about 1.6 GiB with 32, about 3.1 GiB with 64 and
 about 4.8 GiB with 100. Streams this side opens add their own retention. To bound
 the heap, lower `MaxConns`, `MaxDialed`, `MaxIncomingStreams`, `MaxStreamReceiveWindow`

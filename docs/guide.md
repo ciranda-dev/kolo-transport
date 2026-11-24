@@ -158,7 +158,7 @@ window, but it is neither retransmitted nor flow controlled: it can be lost or a
 - `ReceiveDatagram(ctx)` returns the next datagram, `ctx.Err()` when the context ends and the connection's error once it
   has ended. quic-go keeps at most 128 received datagrams per connection and drops the ones that arrive while 128 wait, so
   read promptly.
-- The queues hold up to about 240 KiB per connection, which `MaxMemory` does not count (see [limits.md](limits.md)).
+- The queues hold up to 240 KiB per connection, which `Listen` adds to its `MaxMemory` check for every connection when `Datagrams` is on (see [limits.md](limits.md)).
 
 ## Faster transfers for trusted peers
 
@@ -202,7 +202,7 @@ if peerIsAuthorized(conn) {
   window it has. The budget returns when the connection ends. A connection
   made by package `Dial` has a budget of its own. At the defaults, 64 MiB
   lets 8 connections reach 8 MiB.
-- `Listen` also checks that `MaxMemory` covers the initial windows of
+- `Listen` also checks that `MaxMemory` covers the initial windows (and, with `Datagrams`, the datagram queues) of
   `MaxConns` + `MaxDialed` connections plus the growth they can hold at most.
 - Keep `MaxConnReceiveWindow` equal to `MaxStreamReceiveWindow` (256 KiB
   each) when you turn growth on for a public socket: quic-go does not let the

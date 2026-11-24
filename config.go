@@ -38,6 +38,9 @@ const (
 	congestionBBR   = "bbr"
 )
 
+// datagramQueueBytes is what one connection with datagrams can hold: 128 received and 32 queued to send (quic-go), each in a 1536-byte Go size class.
+const datagramQueueBytes = (128 + 32) * 1536
+
 // defaultCongestionControl is the CongestionControl of a Config that leaves it empty. It is a variable only so the tests can run the suite with BBR.
 var defaultCongestionControl = congestionReno
 
@@ -58,7 +61,7 @@ type Config struct {
 	// KeepAlivePeriod sends a PING after this long without receiving, so connections stay open, also those never accepted.
 	// Default 5s (or IdleTimeout/2 if lower), from 500ms to below IdleTimeout.
 	KeepAlivePeriod time.Duration
-	// MaxMemory must cover (MaxConns + MaxDialed) times MaxConnReceiveWindow (unread data, not heap), in bytes; the default leaves headroom and does not bound heap (see the README). Listener only. Default 1 GiB, from 64 MiB to 64 GiB.
+	// MaxMemory must cover (MaxConns + MaxDialed) times MaxConnReceiveWindow (unread data, not heap), plus 240 KiB of datagram queues each when Datagrams is on, in bytes; the default leaves headroom and does not bound heap (see the README). Listener only. Default 1 GiB, from 64 MiB to 64 GiB.
 	MaxMemory int64
 	// AcceptFunc filters attempts by the source IP a connection starts from, never port or identity; false or a panic refuses.
 	// Listener only. Nil allows all.
@@ -79,7 +82,7 @@ type Config struct {
 	Network string
 	// CongestionControl picks the controller that paces what this end sends: "reno" (the default), "cubic" or "bbr". "bbr" keeps a link full where random loss makes the others crawl, but takes the bandwidth of other flows and holds a standing queue (see the guide).
 	CongestionControl string
-	// Datagrams offers QUIC datagrams (RFC 9221) on Listen and Dial; Conn.SendDatagram and Conn.ReceiveDatagram work only when both ends offer them. Default false.
+	// Datagrams offers QUIC datagrams (RFC 9221) on Listen and Dial; Conn.SendDatagram and Conn.ReceiveDatagram work only when both ends offer them; each connection can then hold 240 KiB of queues, which the MaxMemory check counts. Default false.
 	Datagrams bool
 }
 
@@ -212,7 +215,20 @@ func (c *Config) listenConfig() (Config, error) {
 		grown = min(out.MaxGrownMemory, conns*(out.MaxGrownConnReceiveWindow-out.MaxConnReceiveWindow))
 		need += grown
 	}
+	var queues int64
+	if out.Datagrams {
+		queues = conns * datagramQueueBytes
+		need += queues
+	}
 	if need > out.MaxMemory {
+		if out.Datagrams {
+			growth, remedy := "", "MaxDialed or MaxConnReceiveWindow"
+			if out.WindowGrowth {
+				growth, remedy = " plus window growth of up to "+size(grown), "MaxDialed, MaxConnReceiveWindow or MaxGrownMemory"
+			}
+			return Config{}, fmt.Errorf("%w: (MaxConns %d + MaxDialed %d) × MaxConnReceiveWindow %s%s plus datagram queues of %s needs %s of memory, above MaxMemory %s; raise MaxMemory, lower MaxConns, %s, or turn off Datagrams",
+				ErrInvalidConfig, out.MaxConns, out.MaxDialed, size(out.MaxConnReceiveWindow), growth, size(queues), size(need), size(out.MaxMemory), remedy)
+		}
 		if out.WindowGrowth {
 			return Config{}, fmt.Errorf("%w: (MaxConns %d + MaxDialed %d) × MaxConnReceiveWindow %s plus window growth of up to %s needs %s of receive window, above MaxMemory %s; raise MaxMemory or lower MaxConns, MaxDialed, MaxConnReceiveWindow or MaxGrownMemory",
 				ErrInvalidConfig, out.MaxConns, out.MaxDialed, size(out.MaxConnReceiveWindow), size(grown), size(need), size(out.MaxMemory))
