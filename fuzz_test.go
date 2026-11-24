@@ -119,7 +119,7 @@ func FuzzConfig(f *testing.F) {
 		}
 		if got.MaxConns < 1 ||
 			got.MaxConnsPerIP < 1 || got.MaxConnsPerIP > got.MaxConns ||
-			got.MaxMemory < 64<<20 || got.MaxMemory > 64<<30 ||
+			got.MaxMemory < 64<<20 ||
 			got.MaxStreamReceiveWindow < 64<<10 || got.MaxStreamReceiveWindow > 16<<20 ||
 			got.MaxConnReceiveWindow < got.MaxStreamReceiveWindow || got.MaxConnReceiveWindow > 64<<20 ||
 			got.MaxDialed < 1 ||
@@ -135,7 +135,7 @@ func FuzzConfig(f *testing.F) {
 		}
 		if got.WindowGrowth && (got.MaxGrownStreamReceiveWindow < got.MaxStreamReceiveWindow || got.MaxGrownStreamReceiveWindow > 16<<20 ||
 			got.MaxGrownConnReceiveWindow < got.MaxConnReceiveWindow || got.MaxGrownConnReceiveWindow < got.MaxGrownStreamReceiveWindow ||
-			got.MaxGrownConnReceiveWindow > 64<<20 || got.MaxGrownMemory < 1<<20 || got.MaxGrownMemory > 64<<30) {
+			got.MaxGrownConnReceiveWindow > 64<<20 || got.MaxGrownMemory < 1<<20) {
 			t.Fatalf("growth out of range: %+v", got)
 		}
 		q := got.quic()

@@ -9,21 +9,21 @@ Every option, default and bound of kolo-transport, with the reason for it. A val
 
 | Option | Default | Range | Why |
 |---|---|---|---|
-| `MaxConns` (per listener, handshaking or open) | 100 | at least 1; `MaxMemory` is the upper bound | Security: bounds the state a flood from many addresses makes a public node hold. The `MaxMemory` check (below) is what protects memory, so there is no separate maximum; raise `MaxMemory` with it. |
+| `MaxConns` (per listener, handshaking or open) | 100 (`DefaultMaxConns`) | at least 1; `MaxMemory` is the upper bound | Security: bounds the state a flood from many addresses makes a public node hold. The `MaxMemory` check (below) is what protects memory, so there is no separate maximum; raise `MaxMemory` with it. |
 | `MaxConnsPerIP` (per listener and source address) | 4, or `MaxConns` if lower | 1 to `MaxConns` | Security: stops one address from holding every slot |
-| `MaxDialed` (connections open from `Listener.Dial`) | 32 | at least 1; `MaxMemory` is the upper bound | Memory: bounds the unread data dialed connections can make this node hold, through the same `MaxMemory` check as `MaxConns` |
+| `MaxDialed` (connections open from `Listener.Dial`) | 32 (`DefaultMaxDialed`) | at least 1; `MaxMemory` is the upper bound | Memory: bounds the unread data dialed connections can make this node hold, through the same `MaxMemory` check as `MaxConns` |
 | `MaxIncomingStreams` (concurrent, per connection, bidirectional and unidirectional each) | 16 | 1 to 1000 | Measured: quic-go keeps about 96 heap bytes per byte read on an open stream, so the worst case per connection is about 856 MiB at 16 and 4.8 GiB at 100 (see below) |
 | `HandshakeTimeout` (also the life of a Retry token) | 10s | 1s to 60s | Security: a stalled handshake holds a `MaxConns` slot until it expires |
 | `IdleTimeout` | 30s | 1s to 10m | Memory: ends a connection, and frees its slot, once the peer or the path is gone |
 | `KeepAlivePeriod` (always on) | 5s, or `IdleTimeout`/2 if lower | 500ms to below `IdleTimeout` | Protocol: keeps a connection open while the peer answers; the minimum is 500ms so that the default fits a 1s `IdleTimeout` |
-| `MaxMemory` (must cover (`MaxConns` + `MaxDialed`) × `MaxConnReceiveWindow`, plus 240 KiB of datagram queues per connection when `Datagrams` is on, bytes; unread data and queues, not heap) | 1 GiB (`DefaultMaxMemory`) | 64 MiB to 64 GiB | Memory: checks that the windows, and the datagram queues, of every connection fit |
+| `MaxMemory` (must cover (`MaxConns` + `MaxDialed`) × `MaxConnReceiveWindow`, plus 240 KiB of datagram queues per connection when `Datagrams` is on, bytes; unread data and queues, not heap) | 1 GiB (`DefaultMaxMemory`) | at least 64 MiB; no maximum (see below) | Memory: checks that the windows, and the datagram queues, of every connection fit |
 | `AcceptFunc` (source IP filter) | nil (allow all) | any `func(netip.AddrPort) bool` | Security: refuses source IPs before an attempt takes a slot or any connection state |
 | `MaxStreamReceiveWindow` (advanced; unread bytes per stream) | 256 KiB (`DefaultMaxStreamReceiveWindow`) | 64 KiB to 16 MiB | Measured: about 176 heap bytes per unread byte and 96 per byte read on an open stream, with 1-byte frames (see below) |
 | `MaxConnReceiveWindow` (advanced; unread bytes per connection) | 512 KiB (`DefaultMaxConnReceiveWindow`) | 64 KiB to 64 MiB, at least `MaxStreamReceiveWindow` | Measured: the same heap factors, for the unread data of one connection |
 | `WindowGrowth` (lets `Conn.AllowWindowGrowth` raise the windows of a trusted connection) | false | true or false | Memory: off means every window stays fixed, exactly as before |
 | `MaxGrownStreamReceiveWindow` (growth ceiling of a trusted stream; `WindowGrowth` only) | 4 MiB (`DefaultMaxGrownStreamReceiveWindow`), or `MaxStreamReceiveWindow` if higher | `MaxStreamReceiveWindow` to 16 MiB | Measured: with 100 ms of round trip a 4 MiB window carries 335 Mbit/s |
 | `MaxGrownConnReceiveWindow` (growth ceiling of a trusted connection; `WindowGrowth` only) | 8 MiB (`DefaultMaxGrownConnReceiveWindow`), or `MaxConnReceiveWindow` and `MaxGrownStreamReceiveWindow` if higher | the larger of `MaxConnReceiveWindow` and `MaxGrownStreamReceiveWindow`, to 64 MiB | Memory: quic-go keeps the connection window at 1.5 times a growing stream window |
-| `MaxGrownMemory` (window growth shared by the trusted connections of a `Listener`; `WindowGrowth` only) | 64 MiB (`DefaultMaxGrownMemory`) | 1 MiB to 64 GiB | Memory: bounds how many connections can hold a grown window |
+| `MaxGrownMemory` (window growth shared by the trusted connections of a `Listener`; `WindowGrowth` only) | 64 MiB (`DefaultMaxGrownMemory`) | at least 1 MiB; no maximum | Memory: bounds how many connections can hold a grown window |
 | `Network` (UDP network of the socket `Listen` opens) | `"udp4"` | `"udp4"` only | Protocol: kolo-transport is IPv4 only |
 | `Datagrams` (offers QUIC datagrams, RFC 9221) | false | true or false | Protocol: a connection carries datagrams only when both ends offer them; off, nothing changes |
 | `CongestionControl` (pacing of what this end sends) | `"reno"` | `"reno"`, `"cubic"` or `"bbr"` | Protocol: Reno is quic-go's own and `"cubic"` is the Cubic branch of the same code; BBR fills a link that loses packets at random, but holds a queue and takes bandwidth from Reno flows (see "Queue" below and the [guide](guide.md#congestion-control)) |
@@ -34,7 +34,7 @@ Every option, default and bound of kolo-transport, with the reason for it. A val
 | Path MTU black hole detection (fixed) | more than 3 suspicious loss bursts, or 3 probe timeouts in a row | fixed | Protocol: MAX_PROBES of RFC 8899 section 5.1.2; the packet size falls back to 1200 bytes (RFC 9000 section 14.1) and the search starts again (see "Packet size" in [guide.md](guide.md#packet-size)) |
 | `MaxPacketSize` (non-QUIC datagram) | 1200 bytes | fixed | Protocol: the 1200 bytes QUIC starts with, so it fits any path QUIC works on |
 | Read buffer (fixed in quic-go) | 1452 bytes | fixed | Protocol: fixed by quic-go (internal/protocol/protocol.go:111) |
-| Datagram queues (fixed in quic-go; only on a connection whose ends both set `Datagrams`) | 128 received and 32 queued to send, per connection | fixed | Memory: fixed by quic-go (datagram_queue.go:15-16); each datagram is at most one packet of 1452 bytes, so a connection holds at most 160 × 1452 bytes (227 KiB), 240 KiB of heap since Go rounds each buffer up to 1536 bytes (160 × 1536); the `MaxMemory` check counts 240 KiB per connection when `Datagrams` is on (see below) |
+| Datagram queues (fixed in quic-go; only on a connection whose ends both set `Datagrams`) | 128 received and 32 queued to send, per connection | fixed | Memory: fixed by quic-go (datagram_queue.go:15-16); each datagram is at most one packet of 1452 bytes, so a connection holds at most 160 × 1452 bytes (227 KiB), 240 KiB of heap since Go rounds each buffer up to 1536 bytes (160 × 1536); the `MaxMemory` check counts 240 KiB (`DatagramQueueBytes`) per connection when `Datagrams` is on (see below) |
 | `CloseWithError` message | 256 bytes | 0 to 256 | Protocol: 256 bytes always fit one packet; peers drop the text (see Errors in [guide.md](guide.md#errors)) |
 | `Listener.Close` fallback (fixed) | 1s | fixed | Protocol: closes a `PacketConn` that ignores read deadlines (see [Caller-supplied sockets](guide.md#caller-supplied-sockets)) |
 
@@ -111,9 +111,11 @@ bound the heap. Otherwise `Listen` returns `ErrInvalidConfig` with a
 message naming the ways out, such as "(MaxConns 1000 + MaxDialed 32) ×
 MaxConnReceiveWindow 512 KiB needs 516 MiB of receive window, above
 MaxMemory 256 MiB; raise MaxMemory or lower MaxConns, MaxDialed or
-MaxConnReceiveWindow". The 64 GiB maximum is a sanity limit.
+MaxConnReceiveWindow".
 
-`MaxConns` and `MaxDialed` have no maximum of their own. To hold more connections, raise `MaxMemory` with them: the check allows `MaxConns` + `MaxDialed` up to `MaxMemory` / `MaxConnReceiveWindow`, which is 2048 at the defaults and about 1 million at 64 GiB with 64 KiB windows (about 221 thousand with `Datagrams`, whose queues add 240 KiB per connection).
+`MaxMemory` and `MaxGrownMemory` have no maximum: they are budgets the check compares with, not memory the listener takes. The check is computed without overflow on every platform; a configuration whose sum does not fit an `int64` (`math.MaxInt64` bytes, about 8 EiB) is `ErrInvalidConfig`. That is the only upper bound, and it comes from the type.
+
+`MaxConns` and `MaxDialed` have no maximum of their own. To hold more connections, raise `MaxMemory` with them: the check allows `MaxConns` + `MaxDialed` up to `MaxMemory` / `MaxConnReceiveWindow`, which is 2048 at the defaults and about 1 million per 64 GiB with 64 KiB windows (about 221 thousand with `Datagrams`, whose queues add 240 KiB per connection).
 
 Small windows limit throughput to about window / RTT: at 100 ms, the
 defaults allow about 40 Mbit/s per connection and 20 Mbit/s per stream.

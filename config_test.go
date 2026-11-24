@@ -5,6 +5,7 @@ import (
 	"errors"
 	"math"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -51,7 +52,8 @@ func TestConfigDefaults(t *testing.T) {
 		q.InitialConnectionReceiveWindow != 512<<10 || q.MaxConnectionReceiveWindow != 512<<10 {
 		t.Fatalf("windows %+v", q)
 	}
-	if DefaultMaxStreamReceiveWindow != 256<<10 || DefaultMaxConnReceiveWindow != 512<<10 || DefaultMaxMemory != 1<<30 {
+	if DefaultMaxStreamReceiveWindow != 256<<10 || DefaultMaxConnReceiveWindow != 512<<10 || DefaultMaxMemory != 1<<30 ||
+		DefaultMaxConns != 100 || DefaultMaxDialed != 32 || DatagramQueueBytes != 240<<10 {
 		t.Fatal("default constants changed")
 	}
 	d, err := (*Config)(nil).withDefaults()
@@ -130,7 +132,6 @@ func TestConfigRejectsOutOfRange(t *testing.T) {
 		"stream above conn":     {MaxStreamReceiveWindow: 1 << 20, MaxConnReceiveWindow: 512 << 10},
 		"stream above default":  {MaxStreamReceiveWindow: 1 << 20},
 		"small memory":          {MaxMemory: 64<<20 - 1},
-		"huge memory":           {MaxMemory: 64<<30 + 1},
 		"negative memory":       {MaxMemory: -1},
 		"conns over set memory": {MaxConns: 129, MaxMemory: 64 << 20},
 		"dialed over memory":    {MaxConns: 97, MaxMemory: 64 << 20},
@@ -245,6 +246,54 @@ func TestCountsHaveNoRangeMaximum(t *testing.T) {
 		if _, err := c.listenConfig(); !errors.Is(err, ErrInvalidConfig) {
 			t.Errorf("%+v: got %v", c, err)
 		}
+	}
+}
+
+func TestMemoryHasNoRangeMaximum(t *testing.T) {
+	for _, c := range []Config{
+		{MaxMemory: 64<<30 + 1},
+		{MaxMemory: math.MaxInt64},
+		{MaxMemory: 2 << 30, WindowGrowth: true, MaxGrownMemory: 64<<30 + 1},
+		{MaxMemory: math.MaxInt64, WindowGrowth: true, MaxGrownMemory: math.MaxInt64, Datagrams: true},
+	} {
+		got, err := c.listenConfig()
+		if err != nil || got.MaxMemory != c.MaxMemory || got.MaxGrownMemory != c.MaxGrownMemory {
+			t.Errorf("%+v: %+v, %v", c, got, err)
+		}
+	}
+	if _, err := (&Config{MaxMemory: 64<<20 - 1}).listenConfig(); err == nil || err.Error() != "kolotransport: invalid config: MaxMemory must be at least 64 MiB" {
+		t.Fatalf("below 64 MiB: %v", err)
+	}
+}
+
+func TestMemoryCheckIsExactAtAnySize(t *testing.T) {
+	if strconv.IntSize < 64 {
+		t.Skip("needs a 64-bit int")
+	}
+	shift := 33
+	n := 1 << shift
+	c := Config{MaxConns: n, MaxConnsPerIP: 1, MaxDialed: 1, MaxConnReceiveWindow: 64 << 10, MaxMemory: int64(n+1) * (64 << 10)}
+	if _, err := c.listenConfig(); err != nil {
+		t.Fatalf("exact fit of 2^33 + 1 connections: %v", err)
+	}
+	c.MaxMemory--
+	if _, err := c.listenConfig(); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("one byte short: %v", err)
+	}
+	win := int64(DefaultMaxConnReceiveWindow)
+	near := int(math.MaxInt64/win) - DefaultMaxDialed
+	for name, c := range map[string]Config{
+		"count sum":   {MaxConns: math.MaxInt, MaxDialed: math.MaxInt, MaxMemory: math.MaxInt64},
+		"windows":     {MaxConns: near + 1, MaxMemory: math.MaxInt64},
+		"queues":      {MaxConns: near, MaxMemory: math.MaxInt64, Datagrams: true},
+		"growth term": {MaxConns: near, MaxMemory: math.MaxInt64, WindowGrowth: true, MaxGrownMemory: math.MaxInt64},
+	} {
+		if _, err := c.listenConfig(); !errors.Is(err, ErrInvalidConfig) || !strings.Contains(err.Error(), "int64") {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	if _, err := (&Config{MaxConns: near, MaxMemory: math.MaxInt64}).listenConfig(); err != nil {
+		t.Fatalf("the most connections an int64 of windows counts: %v", err)
 	}
 }
 

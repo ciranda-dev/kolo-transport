@@ -20,6 +20,12 @@ const DefaultMaxConnReceiveWindow = 512 << 10
 // such as a tunnel or a mobile carrier's, drops. Path MTU discovery stays on and raises it where the path allows.
 const initialPacketSize = 1200
 
+// DefaultMaxConns is the default MaxConns: 100.
+const DefaultMaxConns = 100
+
+// DefaultMaxDialed is the default MaxDialed: 32.
+const DefaultMaxDialed = 32
+
 // DefaultMaxMemory is the default MaxMemory: 1 GiB of receive window.
 const DefaultMaxMemory = 1 << 30
 
@@ -38,8 +44,8 @@ const (
 	congestionBBR   = "bbr"
 )
 
-// datagramQueueBytes is what one connection with datagrams can hold: 128 received and 32 queued to send (quic-go), each in a 1536-byte Go size class.
-const datagramQueueBytes = (128 + 32) * 1536
+// DatagramQueueBytes is what the MaxMemory check counts per connection when Datagrams is on: 128 received and 32 queued to send, 1536 bytes each (240 KiB).
+const DatagramQueueBytes = (128 + 32) * 1536
 
 // defaultCongestionControl is the CongestionControl of a Config that leaves it empty. It is a variable only so the tests can run the suite with BBR.
 var defaultCongestionControl = congestionReno
@@ -61,7 +67,7 @@ type Config struct {
 	// KeepAlivePeriod sends a PING after this long without receiving, so connections stay open, also those never accepted.
 	// Default 5s (or IdleTimeout/2 if lower), from 500ms to below IdleTimeout.
 	KeepAlivePeriod time.Duration
-	// MaxMemory must cover (MaxConns + MaxDialed) times MaxConnReceiveWindow (unread data, not heap), plus 240 KiB of datagram queues each when Datagrams is on, in bytes; the default leaves headroom and does not bound heap (see the README). Listener only. Default 1 GiB, from 64 MiB to 64 GiB.
+	// MaxMemory must cover (MaxConns + MaxDialed) times MaxConnReceiveWindow (unread data, not heap), plus 240 KiB of datagram queues each when Datagrams is on, in bytes; the default leaves headroom and does not bound heap (see the README). Listener only. Default 1 GiB, at least 64 MiB.
 	MaxMemory int64
 	// AcceptFunc filters attempts by the source IP a connection starts from, never port or identity; false or a panic refuses.
 	// Listener only. Nil allows all.
@@ -76,7 +82,7 @@ type Config struct {
 	MaxGrownStreamReceiveWindow int64
 	// MaxGrownConnReceiveWindow is the largest connection window a trusted connection can reach, in bytes. WindowGrowth only. Default 8 MiB (or MaxConnReceiveWindow if higher), from MaxConnReceiveWindow and MaxGrownStreamReceiveWindow to 64 MiB.
 	MaxGrownConnReceiveWindow int64
-	// MaxGrownMemory is the connection window growth all trusted connections of a Listener share, in bytes (a dialed Conn has its own); growth stops when it is used up and returns when a connection ends. WindowGrowth only. Default 64 MiB, from 1 MiB to 64 GiB.
+	// MaxGrownMemory is the connection window growth all trusted connections of a Listener share, in bytes (a dialed Conn has its own); growth stops when it is used up and returns when a connection ends. WindowGrowth only. Default 64 MiB, at least 1 MiB.
 	MaxGrownMemory int64
 	// Network selects the UDP network of the socket Listen opens. Listener only. Default "udp4", the only accepted value: IPv6 is refused.
 	Network string
@@ -92,13 +98,11 @@ type limit[T int | int64 | time.Duration] struct {
 }
 
 var (
-	limitMemory    = limit[int64]{"MaxMemory", DefaultMaxMemory, 64 << 20, 64 << 30}
 	limitStreams   = limit[int]{"MaxIncomingStreams", 16, 1, 1000}
 	limitHandshake = limit[time.Duration]{"HandshakeTimeout", 10 * time.Second, time.Second, time.Minute}
 	limitIdle      = limit[time.Duration]{"IdleTimeout", 30 * time.Second, time.Second, 10 * time.Minute}
 	limitStreamWin = limit[int64]{"MaxStreamReceiveWindow", DefaultMaxStreamReceiveWindow, 64 << 10, 16 << 20}
 	limitConnWin   = limit[int64]{"MaxConnReceiveWindow", DefaultMaxConnReceiveWindow, 64 << 10, 64 << 20}
-	limitGrownMem  = limit[int64]{"MaxGrownMemory", DefaultMaxGrownMemory, 1 << 20, 64 << 30}
 )
 
 func (l limit[T]) apply(v *T) error {
@@ -107,6 +111,16 @@ func (l limit[T]) apply(v *T) error {
 		*v = l.def
 	case *v < l.min || *v > l.max:
 		return fmt.Errorf("%w: %s must be between %v and %v", ErrInvalidConfig, l.name, l.min, l.max)
+	}
+	return nil
+}
+
+func applyAtLeast(name string, v *int64, def, lo int64) error {
+	switch {
+	case *v == 0:
+		*v = def
+	case *v < lo:
+		return fmt.Errorf("%w: %s must be at least %s", ErrInvalidConfig, name, size(lo))
 	}
 	return nil
 }
@@ -181,7 +195,7 @@ func (c *Config) growthDefaults() error {
 	if err := conn.apply(&c.MaxGrownConnReceiveWindow); err != nil {
 		return err
 	}
-	return limitGrownMem.apply(&c.MaxGrownMemory)
+	return applyAtLeast("MaxGrownMemory", &c.MaxGrownMemory, DefaultMaxGrownMemory, 1<<20)
 }
 
 func (c *Config) listenConfig() (Config, error) {
@@ -195,30 +209,22 @@ func (c *Config) listenConfig() (Config, error) {
 	if out.Network != "udp4" {
 		return Config{}, fmt.Errorf("%w: Network must be \"udp4\", not %q; IPv6 is refused", ErrInvalidConfig, out.Network)
 	}
-	if err := applyCount("MaxConns", &out.MaxConns, 100); err != nil {
+	if err := applyCount("MaxConns", &out.MaxConns, DefaultMaxConns); err != nil {
 		return Config{}, err
 	}
 	if err := (limit[int]{"MaxConnsPerIP", min(4, out.MaxConns), 1, out.MaxConns}).apply(&out.MaxConnsPerIP); err != nil {
 		return Config{}, err
 	}
-	if err := applyCount("MaxDialed", &out.MaxDialed, 32); err != nil {
+	if err := applyCount("MaxDialed", &out.MaxDialed, DefaultMaxDialed); err != nil {
 		return Config{}, err
 	}
-	if err := limitMemory.apply(&out.MaxMemory); err != nil {
+	if err := applyAtLeast("MaxMemory", &out.MaxMemory, DefaultMaxMemory, 64<<20); err != nil {
 		return Config{}, err
 	}
-	// Even 1<<31 connections of 64 KiB need 128 TiB, above any MaxMemory, so clamping there keeps the products below from overflowing.
-	conns := min(int64(out.MaxConns), math.MaxInt32) + min(int64(out.MaxDialed), math.MaxInt32)
-	need := conns * out.MaxConnReceiveWindow
-	var grown int64
-	if out.WindowGrowth {
-		grown = min(out.MaxGrownMemory, conns*(out.MaxGrownConnReceiveWindow-out.MaxConnReceiveWindow))
-		need += grown
-	}
-	var queues int64
-	if out.Datagrams {
-		queues = conns * datagramQueueBytes
-		need += queues
+	need, grown, queues, ok := out.memoryNeed()
+	if !ok {
+		return Config{}, fmt.Errorf("%w: MaxConns %d + MaxDialed %d need more memory than an int64 counts, above MaxMemory %s; lower MaxConns or MaxDialed",
+			ErrInvalidConfig, out.MaxConns, out.MaxDialed, size(out.MaxMemory))
 	}
 	if need > out.MaxMemory {
 		if out.Datagrams {
@@ -237,6 +243,39 @@ func (c *Config) listenConfig() (Config, error) {
 			ErrInvalidConfig, out.MaxConns, out.MaxDialed, size(out.MaxConnReceiveWindow), size(need), size(out.MaxMemory))
 	}
 	return out, nil
+}
+
+// memoryNeed returns what the MaxMemory check counts, with its growth and datagram terms; ok is false when the sum does not fit an int64.
+func (c *Config) memoryNeed() (need, grown, queues int64, ok bool) {
+	conns := int64(c.MaxConns)
+	if conns > math.MaxInt64-int64(c.MaxDialed) {
+		return 0, 0, 0, false
+	}
+	conns += int64(c.MaxDialed)
+	per := c.MaxConnReceiveWindow
+	if c.Datagrams {
+		per += DatagramQueueBytes
+	}
+	if conns > math.MaxInt64/per {
+		return 0, 0, 0, false
+	}
+	need = conns * per
+	if c.Datagrams {
+		queues = conns * DatagramQueueBytes
+	}
+	if c.WindowGrowth {
+		grown = c.MaxGrownMemory
+		if d := c.MaxGrownConnReceiveWindow - c.MaxConnReceiveWindow; d == 0 {
+			grown = 0
+		} else if conns <= grown/d {
+			grown = conns * d
+		}
+		if grown > math.MaxInt64-need {
+			return 0, 0, 0, false
+		}
+		need += grown
+	}
+	return need, grown, queues, true
 }
 
 func size(n int64) string {

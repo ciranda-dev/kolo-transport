@@ -556,7 +556,6 @@ func TestGrowthConfig(t *testing.T) {
 		"grown conn below initial":    {WindowGrowth: true, MaxConnReceiveWindow: 4 << 20, MaxGrownStreamReceiveWindow: 1 << 20, MaxGrownConnReceiveWindow: 2 << 20},
 		"grown conn above 64 MiB":     {WindowGrowth: true, MaxGrownStreamReceiveWindow: 16 << 20, MaxGrownConnReceiveWindow: 64<<20 + 1},
 		"memory below 1 MiB":          {WindowGrowth: true, MaxGrownMemory: 1<<20 - 1},
-		"memory above 64 GiB":         {WindowGrowth: true, MaxGrownMemory: 64<<30 + 1},
 		"negative memory":             {WindowGrowth: true, MaxGrownMemory: -1},
 		"grown stream without growth": {MaxGrownStreamReceiveWindow: 1 << 20},
 		"grown conn without growth":   {MaxGrownConnReceiveWindow: 1 << 20},
