@@ -117,13 +117,13 @@ func FuzzConfig(f *testing.F) {
 			}
 			return
 		}
-		if got.MaxConns < 1 || got.MaxConns > 10000 ||
+		if got.MaxConns < 1 ||
 			got.MaxConnsPerIP < 1 || got.MaxConnsPerIP > got.MaxConns ||
 			got.MaxMemory < 64<<20 || got.MaxMemory > 64<<30 ||
 			got.MaxStreamReceiveWindow < 64<<10 || got.MaxStreamReceiveWindow > 16<<20 ||
 			got.MaxConnReceiveWindow < got.MaxStreamReceiveWindow || got.MaxConnReceiveWindow > 64<<20 ||
-			got.MaxDialed < 1 || got.MaxDialed > 10000 ||
-			int64(got.MaxConns+got.MaxDialed)*got.MaxConnReceiveWindow > got.MaxMemory ||
+			got.MaxDialed < 1 ||
+			(int64(got.MaxConns)+int64(got.MaxDialed))*got.MaxConnReceiveWindow > got.MaxMemory ||
 			got.MaxIncomingStreams < 1 || got.MaxIncomingStreams > 1000 ||
 			got.HandshakeTimeout < time.Second || got.HandshakeTimeout > time.Minute ||
 			got.IdleTimeout < time.Second || got.IdleTimeout > 10*time.Minute ||

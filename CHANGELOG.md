@@ -7,8 +7,13 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** `Config.MaxConns` and `Config.MaxDialed` no longer have a range maximum of 10000: a value above 10000 that fits `MaxMemory` is now accepted, where it returned `ErrInvalidConfig`. The `MaxMemory` check of (`MaxConns` + `MaxDialed`) × `MaxConnReceiveWindow` is the upper bound, and a value below 1 is still invalid.
+
 ### Added
 
+- `Listener.MaxConns` returns the connection cap of the listener, with the default applied.
 - `Config.Datagrams` (default false) offers QUIC datagrams (RFC 9221); `Conn.SupportsDatagrams` reports whether both ends offered them.
 - `Conn.SendDatagram`, which never blocks: a payload that does not fit in one packet on the current path is `ErrDatagramTooLarge`, and a full send queue (32) drops it with `ErrDatagramDropped`. `Conn.ReceiveDatagram` returns the next datagram (quic-go keeps up to 128). A datagram call on a connection without support is `ErrDatagramsUnsupported`.
 - `Stream.ID`, the QUIC stream ID (RFC 9000 section 2.1).
