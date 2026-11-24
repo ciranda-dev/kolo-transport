@@ -685,6 +685,7 @@ runLoop:
 				c.setCloseError(&closeError{err: err})
 				break runLoop
 			}
+			c.handleBlackHole(now)
 		}
 
 		if keepAliveTime := c.nextKeepAliveTime(); !keepAliveTime.IsZero() && !now.Before(keepAliveTime) {
@@ -2239,6 +2240,7 @@ func (c *Conn) handleAckFrame(frame *wire.AckFrame, encLevel protocol.Encryption
 	if err != nil {
 		return err
 	}
+	c.handleBlackHole(rcvTime)
 	if !acked1RTTPacket {
 		return nil
 	}
@@ -2260,6 +2262,23 @@ func (c *Conn) handleAckFrame(frame *wire.AckFrame, encLevel protocol.Encryption
 		}
 	}
 	return c.cryptoStreamHandler.SetLargest1RTTAcked(frame.LargestAcked())
+}
+
+// handleBlackHole brings the packet size back to the 1200 bytes every path carries once losses show the path no longer
+// carries the larger size, and searches again from there (RFC 8899 sections 4.3 and 5.2, RFC 9000 section 14.3).
+func (c *Conn) handleBlackHole(now monotime.Time) {
+	if !c.sentPacketHandler.BlackHoleDetected() || c.mtuDiscoverer == nil || c.mtuDiscoverer.CurrentSize() <= protocol.MinInitialPacketSize {
+		return
+	}
+	c.mtuDiscoverer.Reset(protocol.MinInitialPacketSize, c.maxMTU())
+	c.maxPayloadSizeEstimate.Store(uint32(estimateMaxPayloadSize(protocol.MinInitialPacketSize)))
+	c.sentPacketHandler.SetMaxDatagramSize(protocol.MinInitialPacketSize)
+	if c.qlogger != nil {
+		c.qlogger.RecordEvent(qlog.MTUUpdated{Value: int(protocol.MinInitialPacketSize)})
+	}
+	if !c.config.DisablePathMTUDiscovery && c.conn.capabilities().DF {
+		c.mtuDiscoverer.Start(now)
+	}
 }
 
 func (c *Conn) handleDatagramFrame(f *wire.DatagramFrame) error {
@@ -3165,8 +3184,27 @@ func (c *Conn) recordStreamPriorityUpdated(id protocol.StreamID, urgency int8, i
 // In addition, a datagram may be dropped before being sent out if the available packet size suddenly decreases.
 // If the payload is too large to be sent at the current time, a [DatagramTooLargeError] is returned.
 func (c *Conn) SendDatagram(p []byte) error {
+	f, err := c.datagramFrame(p)
+	if err != nil {
+		return err
+	}
+	return c.datagramQueue.Add(f)
+}
+
+// TrySendDatagram is SendDatagram without blocking: while the send queue is full,
+// it drops the datagram and returns false.
+func (c *Conn) TrySendDatagram(p []byte) (bool, error) {
+	f, err := c.datagramFrame(p)
+	if err != nil {
+		return false, err
+	}
+	return c.datagramQueue.TryAdd(f)
+}
+
+// datagramFrame makes the DATAGRAM frame of SendDatagram and TrySendDatagram.
+func (c *Conn) datagramFrame(p []byte) (*wire.DatagramFrame, error) {
 	if !c.supportsDatagrams() {
-		return errors.New("datagram support disabled")
+		return nil, errors.New("datagram support disabled")
 	}
 
 	f := &wire.DatagramFrame{DataLenPresent: true}
@@ -3177,11 +3215,11 @@ func (c *Conn) SendDatagram(p []byte) error {
 		protocol.ByteCount(c.maxPayloadSizeEstimate.Load()),
 	)
 	if protocol.ByteCount(len(p)) > maxDataLen {
-		return &DatagramTooLargeError{MaxDatagramPayloadSize: int64(maxDataLen)}
+		return nil, &DatagramTooLargeError{MaxDatagramPayloadSize: int64(maxDataLen)}
 	}
 	f.Data = make([]byte, len(p))
 	copy(f.Data, p)
-	return c.datagramQueue.Add(f)
+	return f, nil
 }
 
 // ReceiveDatagram gets a message received in a QUIC datagram, as specified in RFC 9221.

@@ -1,5 +1,5 @@
 Changes to quic-go v0.65.0, applied by scripts/vendor-quicgo.sh (patch -p1, before the import paths are rewritten).
-The patch is the only edit to the vendored code. It adds a hook for a pluggable congestion controller and the statistics kolotransport.Conn.Stats reads, and nothing else.
+The patch is the only edit to the vendored code. It adds a hook for a pluggable congestion controller, the statistics kolotransport.Conn.Stats reads, a datagram send that never blocks and path MTU black hole detection, and nothing else.
 
   congestion/interface.go (new)          the controller interface, AckedPacketInfo and LostPacketInfo
   monotime/time.go (new)                 exports the clock type the controller interface uses
@@ -22,9 +22,27 @@ The patch is the only edit to the vendored code. It adds a hook for a pluggable 
   internal/congestion/cubic_sender.go    Name, "reno" or "cubic"
   connection.go                          Conn.SetCongestionControlFactory, Conn.UseCubic, Conn.CongestionControlName;
                                          ConnectionStats gets HasRTT, BytesInFlight, BandwidthEstimate,
-                                         MaxDatagramSize and PathChanges
+                                         MaxDatagramSize and PathChanges; Conn.TrySendDatagram, a variant of
+                                         SendDatagram that drops instead of waiting while the send queue is full
+                                         (SendDatagram still waits; both share datagramFrame, its checks and copy)
+  datagram_queue.go                      TryAdd, Add that returns false instead of waiting for room in the 32-frame queue
   internal/utils/connstats.go            the counters behind those fields
   internal/utils/rtt_stats.go            hasMeasurement is atomic, so another goroutine can read it
+  internal/ackhandler/black_hole.go (new) black hole detection (RFC 8899 section 4.3): more than 3 loss bursts of packets
+                                         larger than 1200 bytes that no later acknowledged packet as large explains
+  internal/ackhandler/black_hole_test.go (new)
+                                         its tests, and those of the sent packet handler's reports
+  internal/ackhandler/sent_packet_handler.go, interfaces.go (black hole)
+                                         feeds the detector the acknowledged and lost 1-RTT packets, reports 3 probe
+                                         timeouts in a row with a packet larger than 1200 bytes outstanding (RFC 4821
+                                         section 7.7), resets it on a path migration; BlackHoleDetected reports once and
+                                         starts over, ignoring the packets sent before the report
+  packet_packer.go                       drops a queued DATAGRAM frame larger than a whole packet, even when the packet
+                                         carries an ACK, so it does not hold back the queue after a fall back
+  packet_packer_datagram_test.go (new)   its test
+  connection.go (black hole)             handleBlackHole, after each ACK and loss timer: the packet size, the datagram
+                                         limit and the congestion controller's datagram size fall back to 1200 bytes
+                                         and path MTU discovery starts again
 
 diff -ruN a/congestion/interface.go b/congestion/interface.go
 --- a/congestion/interface.go
@@ -101,7 +119,15 @@ diff -ruN a/connection.go b/connection.go
  	"github.com/quic-go/quic-go/internal/ackhandler"
  	"github.com/quic-go/quic-go/internal/handshake"
  	"github.com/quic-go/quic-go/internal/monotime"
-@@ -804,11 +805,26 @@
+@@ -684,6 +685,7 @@
+ 				c.setCloseError(&closeError{err: err})
+ 				break runLoop
+ 			}
++			c.handleBlackHole(now)
+ 		}
+ 
+ 		if keepAliveTime := c.nextKeepAliveTime(); !keepAliveTime.IsZero() && !now.Before(keepAliveTime) {
+@@ -804,11 +806,26 @@
  	// MeanDeviation estimates the variation in the RTT samples using a mean
  	// variation. See https://www.rfc-editor.org/rfc/rfc9002#section-5.3
  	MeanDeviation time.Duration
@@ -128,7 +154,7 @@ diff -ruN a/connection.go b/connection.go
  
  	// BytesSent is the number of bytes sent on the underlying connection,
  	// including retransmissions. Does not include UDP or any other outer
-@@ -843,8 +859,13 @@
+@@ -843,8 +860,13 @@
  		LatestRTT:     c.rttStats.LatestRTT(),
  		SmoothedRTT:   c.rttStats.SmoothedRTT(),
  		MeanDeviation: c.rttStats.MeanDeviation(),
@@ -143,7 +169,7 @@ diff -ruN a/connection.go b/connection.go
  
  		BytesSent:       c.connStats.BytesSent.Load(),
  		PacketsSent:     c.connStats.PacketsSent.Load(),
-@@ -935,6 +956,7 @@
+@@ -935,6 +957,7 @@
  
  	initialPacketSize := protocol.ByteCount(cmp.Or(c.config.InitialPacketSize, protocol.MinInitialPacketSize))
  	c.sentPacketHandler.MigratedPath(now, initialPacketSize)
@@ -151,7 +177,7 @@ diff -ruN a/connection.go b/connection.go
  	c.maxPayloadSizeEstimate.Store(uint32(estimateMaxPayloadSize(initialPacketSize)))
  	c.mtuDiscoverer.Reset(initialPacketSize, c.maxMTU())
  	c.conn = newSendConn(tr.conn, c.conn.RemoteAddr(), packetInfo{}, utils.DefaultLogger) // TODO: find a better way
-@@ -1324,6 +1346,7 @@
+@@ -1324,6 +1347,7 @@
  	c.connIDManager.SwitchToPath(path)
  	initialPacketSize := protocol.ByteCount(cmp.Or(c.config.InitialPacketSize, protocol.MinInitialPacketSize))
  	c.sentPacketHandler.MigratedPath(p.rcvTime, initialPacketSize)
@@ -159,7 +185,82 @@ diff -ruN a/connection.go b/connection.go
  	c.maxPayloadSizeEstimate.Store(uint32(estimateMaxPayloadSize(initialPacketSize)))
  	c.mtuDiscoverer.Reset(initialPacketSize, c.maxMTU())
  	if !c.config.DisablePathMTUDiscovery && c.conn.capabilities().DF {
-@@ -3261,5 +3284,24 @@
+@@ -2216,6 +2240,7 @@
+ 	if err != nil {
+ 		return err
+ 	}
++	c.handleBlackHole(rcvTime)
+ 	if !acked1RTTPacket {
+ 		return nil
+ 	}
+@@ -2239,6 +2264,23 @@
+ 	return c.cryptoStreamHandler.SetLargest1RTTAcked(frame.LargestAcked())
+ }
+ 
++// handleBlackHole brings the packet size back to the 1200 bytes every path carries once losses show the path no longer
++// carries the larger size, and searches again from there (RFC 8899 sections 4.3 and 5.2, RFC 9000 section 14.3).
++func (c *Conn) handleBlackHole(now monotime.Time) {
++	if !c.sentPacketHandler.BlackHoleDetected() || c.mtuDiscoverer == nil || c.mtuDiscoverer.CurrentSize() <= protocol.MinInitialPacketSize {
++		return
++	}
++	c.mtuDiscoverer.Reset(protocol.MinInitialPacketSize, c.maxMTU())
++	c.maxPayloadSizeEstimate.Store(uint32(estimateMaxPayloadSize(protocol.MinInitialPacketSize)))
++	c.sentPacketHandler.SetMaxDatagramSize(protocol.MinInitialPacketSize)
++	if c.qlogger != nil {
++		c.qlogger.RecordEvent(qlog.MTUUpdated{Value: int(protocol.MinInitialPacketSize)})
++	}
++	if !c.config.DisablePathMTUDiscovery && c.conn.capabilities().DF {
++		c.mtuDiscoverer.Start(now)
++	}
++}
++
+ func (c *Conn) handleDatagramFrame(f *wire.DatagramFrame) error {
+ 	if f.Length(c.version) > wire.MaxDatagramSize {
+ 		return &qerr.TransportError{
+@@ -3142,8 +3184,27 @@
+ // In addition, a datagram may be dropped before being sent out if the available packet size suddenly decreases.
+ // If the payload is too large to be sent at the current time, a [DatagramTooLargeError] is returned.
+ func (c *Conn) SendDatagram(p []byte) error {
++	f, err := c.datagramFrame(p)
++	if err != nil {
++		return err
++	}
++	return c.datagramQueue.Add(f)
++}
++
++// TrySendDatagram is SendDatagram without blocking: while the send queue is full,
++// it drops the datagram and returns false.
++func (c *Conn) TrySendDatagram(p []byte) (bool, error) {
++	f, err := c.datagramFrame(p)
++	if err != nil {
++		return false, err
++	}
++	return c.datagramQueue.TryAdd(f)
++}
++
++// datagramFrame makes the DATAGRAM frame of SendDatagram and TrySendDatagram.
++func (c *Conn) datagramFrame(p []byte) (*wire.DatagramFrame, error) {
+ 	if !c.supportsDatagrams() {
+-		return errors.New("datagram support disabled")
++		return nil, errors.New("datagram support disabled")
+ 	}
+ 
+ 	f := &wire.DatagramFrame{DataLenPresent: true}
+@@ -3154,11 +3215,11 @@
+ 		protocol.ByteCount(c.maxPayloadSizeEstimate.Load()),
+ 	)
+ 	if protocol.ByteCount(len(p)) > maxDataLen {
+-		return &DatagramTooLargeError{MaxDatagramPayloadSize: int64(maxDataLen)}
++		return nil, &DatagramTooLargeError{MaxDatagramPayloadSize: int64(maxDataLen)}
+ 	}
+ 	f.Data = make([]byte, len(p))
+ 	copy(f.Data, p)
+-	return c.datagramQueue.Add(f)
++	return f, nil
+ }
+ 
+ // ReceiveDatagram gets a message received in a QUIC datagram, as specified in RFC 9221.
+@@ -3261,5 +3322,24 @@
  // It is not very sophisticated: it just subtracts the size of header (assuming the maximum
  // connection ID length), and the size of the encryption tag.
  func estimateMaxPayloadSize(mtu protocol.ByteCount) protocol.ByteCount {
@@ -185,6 +286,313 @@ diff -ruN a/connection.go b/connection.go
 +func (c *Conn) CongestionControlName() string {
 +	return c.sentPacketHandler.CongestionControlName()
  }
+diff -ruN a/datagram_queue.go b/datagram_queue.go
+--- a/datagram_queue.go
++++ b/datagram_queue.go
+@@ -81,6 +81,26 @@
+ 	}
+ }
+ 
++// TryAdd queues a new DATAGRAM frame for sending, like Add,
++// but returns false instead of blocking when the queue is full.
++func (h *datagramQueue) TryAdd(f *wire.DatagramFrame) (bool, error) {
++	h.sendMx.Lock()
++	select {
++	case <-h.closed:
++		h.sendMx.Unlock()
++		return false, h.closeErr
++	default:
++	}
++	if h.sendQueue.Len() >= maxDatagramSendQueueLen {
++		h.sendMx.Unlock()
++		return false, nil
++	}
++	h.sendQueue.PushBack(f)
++	h.sendMx.Unlock()
++	h.hasData()
++	return true, nil
++}
++
+ // Peek gets the next DATAGRAM frame for sending.
+ // If actually sent out, Pop needs to be called before the next call to Peek.
+ func (h *datagramQueue) Peek() *wire.DatagramFrame {
+diff -ruN a/internal/ackhandler/black_hole.go b/internal/ackhandler/black_hole.go
+--- a/internal/ackhandler/black_hole.go
++++ b/internal/ackhandler/black_hole.go
+@@ -0,0 +1,79 @@
++package ackhandler
++
++import "github.com/quic-go/quic-go/internal/protocol"
++
++// blackHoleThreshold is MAX_PROBES of RFC 8899 section 5.1.2: more suspicious loss bursts than this, or this many
++// probe timeouts in a row, show that the path stopped carrying the packet size in use (RFC 8899 section 4.3).
++const blackHoleThreshold = 3
++
++// A blackHoleDetector judges from losses whether the path stopped carrying packets larger than the base size of
++// 1200 bytes (RFC 9000 section 14.1), as RFC 8899 section 4.3 suggests. The packets declared lost by one loss detection
++// pass form a burst. A burst is suspicious when all its packets are larger than the base size and no packet at least as
++// large as its smallest one, sent after it, was acknowledged: a smaller path MTU explains it fully.
++type blackHoleDetector struct {
++	suspicious [blackHoleThreshold + 1]protocol.ByteCount // the smallest packet of each suspicious burst
++	n          int
++
++	burstMin  protocol.ByteCount // 0 while no burst is open
++	burstLast protocol.PacketNumber
++
++	// ackedSize is the largest packet acknowledged since the latest suspicious burst (the base size if none), and
++	// ackedPN the newest acknowledged packet of that size.
++	ackedSize protocol.ByteCount
++	ackedPN   protocol.PacketNumber
++}
++
++func newBlackHoleDetector() blackHoleDetector {
++	return blackHoleDetector{ackedSize: protocol.MinInitialPacketSize, ackedPN: protocol.InvalidPacketNumber}
++}
++
++func (d *blackHoleDetector) acked(pn protocol.PacketNumber, size protocol.ByteCount, mtuProbe bool) {
++	switch {
++	case mtuProbe:
++		// A probe is larger than every packet before it, so no earlier burst is explained by the path MTU.
++		d.n = 0
++	case size < d.ackedSize:
++		return
++	case size == d.ackedSize:
++		d.ackedPN = max(d.ackedPN, pn)
++		return
++	default:
++		kept := 0
++		for _, s := range d.suspicious[:d.n] {
++			if s > size {
++				d.suspicious[kept] = s
++				kept++
++			}
++		}
++		d.n = kept
++	}
++	d.ackedSize = size
++	d.ackedPN = pn
++}
++
++func (d *blackHoleDetector) lost(pn protocol.PacketNumber, size protocol.ByteCount) {
++	if d.burstMin == 0 || size < d.burstMin {
++		d.burstMin = size
++	}
++	d.burstLast = max(d.burstLast, pn)
++}
++
++// detected closes the open burst and reports whether the losses show a black hole, then starts counting again.
++func (d *blackHoleDetector) detected() bool {
++	minSize, last := d.burstMin, d.burstLast
++	d.burstMin, d.burstLast = 0, 0
++	if minSize == 0 || minSize <= protocol.MinInitialPacketSize || (last < d.ackedPN && minSize <= d.ackedSize) {
++		return false
++	}
++	if last > d.ackedPN {
++		// Packets sent after the latest acknowledged large one were lost, so it no longer shows what the path carries.
++		d.ackedSize = protocol.MinInitialPacketSize
++	}
++	d.suspicious[d.n] = minSize
++	d.n++
++	if d.n <= blackHoleThreshold {
++		return false
++	}
++	d.n = 0
++	return true
++}
+diff -ruN a/internal/ackhandler/black_hole_test.go b/internal/ackhandler/black_hole_test.go
+--- a/internal/ackhandler/black_hole_test.go
++++ b/internal/ackhandler/black_hole_test.go
+@@ -0,0 +1,190 @@
++package ackhandler
++
++import (
++	"fmt"
++	"testing"
++	"time"
++
++	"github.com/quic-go/quic-go/internal/monotime"
++	"github.com/quic-go/quic-go/internal/protocol"
++	"github.com/quic-go/quic-go/internal/utils"
++	"github.com/quic-go/quic-go/internal/wire"
++)
++
++func TestBlackHoleDetector(t *testing.T) {
++	burst := func(d *blackHoleDetector, pn protocol.PacketNumber, sizes ...protocol.ByteCount) bool {
++		for i, s := range sizes {
++			d.lost(pn+protocol.PacketNumber(i), s)
++		}
++		return d.detected()
++	}
++	t.Run("four bursts of large packets", func(t *testing.T) {
++		d := newBlackHoleDetector()
++		for i := range 4 {
++			d.acked(protocol.PacketNumber(10*i+5), 100, false)
++			if got := burst(&d, protocol.PacketNumber(10*i), 1400, 1452); got != (i == 3) {
++				t.Fatalf("burst %d: detected %v", i+1, got)
++			}
++		}
++		for i := range 3 {
++			if burst(&d, protocol.PacketNumber(100+10*i), 1400) {
++				t.Fatalf("detected again after %d bursts", i+1)
++			}
++		}
++	})
++	t.Run("a burst with a base-size packet", func(t *testing.T) {
++		d := newBlackHoleDetector()
++		for i := range 8 {
++			if burst(&d, protocol.PacketNumber(10*i), 1452, 1200) {
++				t.Fatal("detected")
++			}
++		}
++	})
++	t.Run("a later large packet acknowledged", func(t *testing.T) {
++		d := newBlackHoleDetector()
++		for i := range 3 {
++			burst(&d, protocol.PacketNumber(10*i), 1400)
++		}
++		d.acked(35, 1400, false)
++		if burst(&d, 40, 1400) {
++			t.Fatal("bursts the acknowledgement explains were counted")
++		}
++	})
++	t.Run("bursts older than an acknowledged packet of their size", func(t *testing.T) {
++		d := newBlackHoleDetector()
++		d.acked(100, 1452, false)
++		for i := range 8 {
++			if burst(&d, protocol.PacketNumber(10*i), 1400) {
++				t.Fatal("detected")
++			}
++		}
++	})
++	t.Run("a smaller packet acknowledged", func(t *testing.T) {
++		d := newBlackHoleDetector()
++		for i := range 3 {
++			burst(&d, protocol.PacketNumber(10*i), 1400)
++		}
++		d.acked(35, 1300, false)
++		if !burst(&d, 40, 1400) {
++			t.Fatal("a 1300-byte packet cleared bursts of 1400-byte packets")
++		}
++	})
++	t.Run("a path MTU probe acknowledged", func(t *testing.T) {
++		d := newBlackHoleDetector()
++		for i := range 3 {
++			burst(&d, protocol.PacketNumber(10*i), 1400)
++		}
++		d.acked(35, 1300, true)
++		if burst(&d, 40, 1400) {
++			t.Fatal("bursts before an acknowledged probe were counted")
++		}
++	})
++}
++
++// The sent packet handler reports a black hole when only the small packets of a connection are acknowledged, and
++// after probe timeouts in a row with large packets outstanding, never for the loss of base-size packets.
++func TestSentPacketHandlerBlackHole(t *testing.T) {
++	newHandler := func() *sentPacketHandler {
++		h := NewSentPacketHandler(0, 1200, utils.NewRTTStats(), &utils.ConnectionStats{}, true, false, nil,
++			protocol.PerspectiveServer, nil, utils.DefaultLogger).(*sentPacketHandler)
++		h.DropPackets(protocol.EncryptionInitial, monotime.Now())
++		h.DropPackets(protocol.EncryptionHandshake, monotime.Now())
++		return h
++	}
++	var acked []protocol.PacketNumber
++	send := func(h *sentPacketHandler, now monotime.Time, size protocol.ByteCount) protocol.PacketNumber {
++		pn := h.PopPacketNumber(protocol.PacketNumberSpaceAppData)
++		h.SentPacket(now, pn, protocol.InvalidPacketNumber, nil, []Frame{{Frame: &wire.PingFrame{}}},
++			protocol.Encryption1RTT, protocol.ECNNon, size, false, false)
++		return pn
++	}
++	ack := func(h *sentPacketHandler, now monotime.Time, pns ...protocol.PacketNumber) {
++		acked = append(acked, pns...)
++		f := &wire.AckFrame{}
++		for i := len(acked) - 1; i >= 0; i-- {
++			if n := len(f.AckRanges); n > 0 && f.AckRanges[n-1].Smallest == acked[i]+1 {
++				f.AckRanges[n-1].Smallest = acked[i]
++				continue
++			}
++			f.AckRanges = append(f.AckRanges, wire.AckRange{Smallest: acked[i], Largest: acked[i]})
++		}
++		if _, err := h.ReceivedAck(f, protocol.Encryption1RTT, now); err != nil {
++			t.Fatal(err)
++		}
++	}
++	for _, large := range []protocol.ByteCount{1400, 1200} {
++		acked = nil
++		h := newHandler()
++		now := monotime.Now()
++		var got []bool
++		for range 5 {
++			send(h, now, large)
++			small := []protocol.PacketNumber{send(h, now, 100), send(h, now, 100), send(h, now, 100)}
++			now = now.Add(10 * time.Millisecond)
++			ack(h, now, small...)
++			got = append(got, h.BlackHoleDetected())
++		}
++		if want := large > 1200; got[3] != want || got[0] || got[1] || got[2] {
++			t.Fatalf("losses of %d-byte packets with the small ones acknowledged: reports %v", large, got)
++		}
++	}
++	for _, large := range []protocol.ByteCount{1400, 1200} {
++		acked = nil
++		h := newHandler()
++		now := monotime.Now()
++		ack(h, now, send(h, now, 100))
++		send(h, now, large)
++		var got []bool
++		for range 4 {
++			now = h.GetLossDetectionTimeout()
++			if err := h.OnLossDetectionTimeout(now); err != nil {
++				t.Fatal(err)
++			}
++			got = append(got, h.BlackHoleDetected())
++			send(h, now, large)
++		}
++		if want := large > 1200; got[2] != want || got[0] || got[1] {
++			t.Fatalf("probe timeouts with a %d-byte packet outstanding: reports %v", large, got)
++		}
++	}
++}
++
++// Large packets sent before a report and lost after it do not lead to another one: they were sent at the old size.
++func TestBlackHoleIgnoresPacketsSentBeforeAReport(t *testing.T) {
++	h := NewSentPacketHandler(0, 1200, utils.NewRTTStats(), &utils.ConnectionStats{}, true, false, nil,
++		protocol.PerspectiveServer, nil, utils.DefaultLogger).(*sentPacketHandler)
++	h.DropPackets(protocol.EncryptionInitial, monotime.Now())
++	h.DropPackets(protocol.EncryptionHandshake, monotime.Now())
++	now := monotime.Now()
++	send := func(size protocol.ByteCount) protocol.PacketNumber {
++		pn := h.PopPacketNumber(protocol.PacketNumberSpaceAppData)
++		h.SentPacket(now, pn, protocol.InvalidPacketNumber, nil, []Frame{{Frame: &wire.PingFrame{}}},
++			protocol.Encryption1RTT, protocol.ECNNon, size, false, false)
++		return pn
++	}
++	var groups [][]protocol.PacketNumber
++	for range 8 {
++		send(1400)
++		groups = append(groups, []protocol.PacketNumber{send(100), send(100), send(100)})
++	}
++	var acked []protocol.PacketNumber
++	var got []bool
++	for _, g := range groups {
++		acked = append(acked, g...)
++		f := &wire.AckFrame{}
++		for i := len(acked) - 1; i >= 0; i-- {
++			if n := len(f.AckRanges); n > 0 && f.AckRanges[n-1].Smallest == acked[i]+1 {
++				f.AckRanges[n-1].Smallest = acked[i]
++				continue
++			}
++			f.AckRanges = append(f.AckRanges, wire.AckRange{Smallest: acked[i], Largest: acked[i]})
++		}
++		if _, err := h.ReceivedAck(f, protocol.Encryption1RTT, now); err != nil {
++			t.Fatal(err)
++		}
++		got = append(got, h.BlackHoleDetected())
++	}
++	if want := []bool{false, false, false, true, false, false, false, false}; fmt.Sprint(got) != fmt.Sprint(want) {
++		t.Fatalf("reports %v, want %v", got, want)
++	}
++}
 diff -ruN a/internal/ackhandler/cc_adapter.go b/internal/ackhandler/cc_adapter.go
 --- a/internal/ackhandler/cc_adapter.go
 +++ b/internal/ackhandler/cc_adapter.go
@@ -319,6 +727,15 @@ diff -ruN a/internal/ackhandler/interfaces.go b/internal/ackhandler/interfaces.g
  
  	// only to be called once the handshake is complete
  	QueueProbePacket(protocol.PacketNumberSpace) bool /* was a packet queued */
+@@ -34,6 +41,8 @@
+ 
+ 	GetLossDetectionTimeout() monotime.Time
+ 	OnLossDetectionTimeout(now monotime.Time) error
++	// BlackHoleDetected reports, once, that losses showed the path no longer carries packets larger than 1200 bytes.
++	BlackHoleDetected() bool
+ 
+ 	MigratedPath(now monotime.Time, initialMaxPacketSize protocol.ByteCount)
+ }
 diff -ruN a/internal/ackhandler/sent_packet_handler.go b/internal/ackhandler/sent_packet_handler.go
 --- a/internal/ackhandler/sent_packet_handler.go
 +++ b/internal/ackhandler/sent_packet_handler.go
@@ -356,7 +773,26 @@ diff -ruN a/internal/ackhandler/sent_packet_handler.go b/internal/ackhandler/sen
  
  	// The number of times a PTO has been sent without receiving an ack.
  	ptoCount uint32
-@@ -203,7 +210,7 @@
+@@ -123,6 +130,10 @@
+ 	// Only applies to the application-data packet number space.
+ 	numProbesToSend int
+ 
++	blackHoles    blackHoleDetector
++	blackHole     bool                  // reported by BlackHoleDetected
++	blackHoleFrom protocol.PacketNumber // packets sent before the last report do not count
++
+ 	// The alarm timeout
+ 	alarm alarmTimer
+ 
+@@ -176,6 +187,7 @@
+ 		handshakePackets:   newPacketNumberSpace(),
+ 		appDataPackets:     newPacketNumberSpace(),
+ 		lostPackets:        *newLostPacketTracker(),
++		blackHoles:         newBlackHoleDetector(),
+ 		rttStats:           rttStats,
+ 		connStats:          connStats,
+ 		congestion:         congestion,
+@@ -203,7 +215,7 @@
  		TimerGranularity:        protocol.TimerGranularity,
  	}
  	if initial {
@@ -365,7 +801,7 @@ diff -ruN a/internal/ackhandler/sent_packet_handler.go b/internal/ackhandler/sen
  		ev.InitialRTT = h.rttStats.SmoothedRTT()
  	}
  	h.qlogger.RecordEvent(ev)
-@@ -215,6 +222,7 @@
+@@ -215,6 +227,7 @@
  			panic("negative bytes_in_flight")
  		}
  		h.bytesInFlight -= p.Length
@@ -373,7 +809,7 @@ diff -ruN a/internal/ackhandler/sent_packet_handler.go b/internal/ackhandler/sen
  		if p.Outstanding() {
  			h.getPacketNumberSpace(p.EncryptionLevel.PacketNumberSpace()).numOutstanding--
  		}
-@@ -339,12 +347,16 @@
+@@ -339,12 +352,16 @@
  	if isAckEliciting {
  		pnSpace.lastAckElicitingPacketTime = t
  		h.bytesInFlight += size
@@ -391,7 +827,7 @@ diff -ruN a/internal/ackhandler/sent_packet_handler.go b/internal/ackhandler/sen
  
  	if encLevel == protocol.Encryption1RTT && h.ecnTracker != nil {
  		h.ecnTracker.SentPacket(pn, ecn)
-@@ -391,7 +403,7 @@
+@@ -391,7 +408,7 @@
  			updated = true
  		}
  	}
@@ -400,7 +836,7 @@ diff -ruN a/internal/ackhandler/sent_packet_handler.go b/internal/ackhandler/sen
  		metricsUpdatedEvent.CongestionWindow = int(cwnd)
  		h.lastMetrics.CongestionWindow = metricsUpdatedEvent.CongestionWindow
  		updated = true
-@@ -467,10 +479,13 @@
+@@ -467,10 +484,19 @@
  				}
  				h.largestAckedTime = p.SendTime
  			}
@@ -409,13 +845,19 @@ diff -ruN a/internal/ackhandler/sent_packet_handler.go b/internal/ackhandler/sen
  		}
  	}
  
++	for _, p := range ackedPackets {
++		if p.EncryptionLevel == protocol.Encryption1RTT && !p.isPathProbePacket {
++			h.blackHoles.acked(p.PacketNumber, p.Length, p.IsPathMTUProbePacket)
++		}
++	}
++
 +	h.ackedPacketsInfo = h.ackedPacketsInfo[:0]
 +	h.lostPacketsInfo = h.lostPacketsInfo[:0]
 +
  	// Detect spurious losses even if no outstanding packets were newly acknowledged.
  	var spuriousLosses []protocol.PacketNumber
  	var timeThresholdIncreased bool
-@@ -487,7 +502,7 @@
+@@ -487,7 +513,7 @@
  		if encLevel == protocol.Encryption1RTT && h.ecnTracker != nil && largestAcked > pnSpace.largestAcked {
  			congested := h.ecnTracker.HandleNewlyAcked(ackedPackets, int64(ack.ECT0), int64(ack.ECT1), int64(ack.ECNCE))
  			if congested {
@@ -424,7 +866,7 @@ diff -ruN a/internal/ackhandler/sent_packet_handler.go b/internal/ackhandler/sen
  			}
  		}
  
-@@ -503,9 +518,12 @@
+@@ -503,9 +529,12 @@
  	}
  	// report spurious losses after any new congestion events from this ACK
  	for _, pn := range spuriousLosses {
@@ -438,7 +880,7 @@ diff -ruN a/internal/ackhandler/sent_packet_handler.go b/internal/ackhandler/sen
  		if len(spuriousLosses) > 0 && h.qlogger != nil {
  			h.qlogMetricsUpdated()
  		}
-@@ -517,8 +535,12 @@
+@@ -517,8 +546,12 @@
  
  	var acked1RTTPacket bool
  	for _, p := range ackedPackets {
@@ -453,7 +895,7 @@ diff -ruN a/internal/ackhandler/sent_packet_handler.go b/internal/ackhandler/sen
  		}
  		if p.EncryptionLevel == protocol.Encryption1RTT {
  			acked1RTTPacket = true
-@@ -529,6 +551,11 @@
+@@ -529,6 +562,11 @@
  		}
  	}
  
@@ -465,7 +907,7 @@ diff -ruN a/internal/ackhandler/sent_packet_handler.go b/internal/ackhandler/sen
  	// After this point, we must not use ackedPackets any longer!
  	// We've already returned the buffers.
  	ackedPackets = nil    //nolint:ineffassign // This is just to be on the safe side.
-@@ -884,6 +911,7 @@
+@@ -884,6 +922,7 @@
  }
  
  func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protocol.EncryptionLevel) {
@@ -473,9 +915,13 @@ diff -ruN a/internal/ackhandler/sent_packet_handler.go b/internal/ackhandler/sen
  	pnSpace := h.getPacketNumberSpace(encLevel.PacketNumberSpace())
  	pnSpace.lossTime = 0
  	space := encLevel.PacketNumberSpace()
-@@ -975,8 +1003,15 @@
+@@ -974,9 +1013,19 @@
+ 			if !p.isPathProbePacket && p.IsAckEliciting() {
  				// the bytes in flight need to be reduced no matter if the frames in this packet will be retransmitted
  				h.removeFromBytesInFlight(p)
++				if space == protocol.PacketNumberSpaceAppData && !p.IsPathMTUProbePacket && pn >= h.blackHoleFrom {
++					h.blackHoles.lost(pn, p.Length)
++				}
  				h.queueFramesForRetransmission(p)
 -				if !p.IsPathMTUProbePacket {
 -					h.congestion.OnCongestionEvent(pn, p.Length, priorInFlight)
@@ -491,7 +937,17 @@ diff -ruN a/internal/ackhandler/sent_packet_handler.go b/internal/ackhandler/sen
  				}
  				if encLevel == protocol.Encryption1RTT && h.ecnTracker != nil {
  					h.ecnTracker.LostPacket(pn)
-@@ -1000,6 +1035,7 @@
+@@ -984,6 +1033,9 @@
+ 			}
+ 		}
+ 	}
++	if space == protocol.PacketNumberSpaceAppData && h.blackHoles.detected() {
++		h.blackHole = true
++	}
+ 	if h.handshakeConfirmed && h.handshakePNs != nil {
+ 		firstPN := h.hist.FirstPacketNumber()
+ 		highestPN := h.handshakePNs.Highest()
+@@ -1000,6 +1052,7 @@
  		h.detectLostPathProbes(now)
  	}
  
@@ -499,7 +955,7 @@ diff -ruN a/internal/ackhandler/sent_packet_handler.go b/internal/ackhandler/sen
  	earliestLossTime, encLevel := h.getLossTimeAndSpace()
  	if !earliestLossTime.IsZero() {
  		if h.logger.Debug() {
-@@ -1014,6 +1050,11 @@
+@@ -1014,6 +1067,11 @@
  		}
  		// Early retransmit or time loss detection
  		h.detectLostPackets(now, encLevel)
@@ -511,7 +967,44 @@ diff -ruN a/internal/ackhandler/sent_packet_handler.go b/internal/ackhandler/sen
  		return nil
  	}
  
-@@ -1127,9 +1168,9 @@
+@@ -1067,12 +1125,36 @@
+ 		pn := h.PopPacketNumber(protocol.PacketNumberSpaceAppData)
+ 		h.hist.SkippedPacket(pn)
+ 		h.ptoMode = SendPTOAppData
++		// Probe timeouts in a row with large packets outstanding are a full-stop timeout (RFC 4821 section 7.7).
++		if h.ptoCount >= blackHoleThreshold && h.largePacketOutstanding() {
++			h.blackHole = true
++		}
+ 	default:
+ 		return fmt.Errorf("PTO timer in unexpected encryption level: %s", encLevel)
+ 	}
+ 	return nil
+ }
+ 
++func (h *sentPacketHandler) largePacketOutstanding() bool {
++	for pn, p := range h.hist.Packets() {
++		if pn >= h.blackHoleFrom && p.EncryptionLevel == protocol.Encryption1RTT && p.Outstanding() && p.Length > protocol.MinInitialPacketSize {
++			return true
++		}
++	}
++	return false
++}
++
++func (h *sentPacketHandler) BlackHoleDetected() bool {
++	if !h.blackHole {
++		return false
++	}
++	// The packets in flight were sent at the old size: their losses say nothing about the new one.
++	h.blackHole = false
++	h.blackHoles = newBlackHoleDetector()
++	h.blackHoleFrom = h.appDataPackets.largestSent + 1
++	return true
++}
++
+ func (h *sentPacketHandler) GetLossDetectionTimeout() monotime.Time {
+ 	return h.alarm.Time
+ }
+@@ -1127,9 +1209,9 @@
  		return h.ptoMode
  	}
  	// Only send ACKs if we're congestion limited.
@@ -523,7 +1016,7 @@ diff -ruN a/internal/ackhandler/sent_packet_handler.go b/internal/ackhandler/sen
  		}
  		return SendAck
  	}
-@@ -1139,18 +1180,18 @@
+@@ -1139,18 +1221,18 @@
  		}
  		return SendAck
  	}
@@ -545,7 +1038,7 @@ diff -ruN a/internal/ackhandler/sent_packet_handler.go b/internal/ackhandler/sen
  }
  
  func (h *sentPacketHandler) isAmplificationLimited() bool {
-@@ -1194,6 +1235,7 @@
+@@ -1194,6 +1276,7 @@
  
  func (h *sentPacketHandler) ResetForRetry(now monotime.Time) {
  	h.bytesInFlight = 0
@@ -553,7 +1046,16 @@ diff -ruN a/internal/ackhandler/sent_packet_handler.go b/internal/ackhandler/sen
  	var firstPacketSendTime monotime.Time
  	// Only Initial and 0-RTT packets can have been sent before a Retry.
  	for _, p := range h.hist.Packets() {
-@@ -1257,14 +1299,68 @@
+@@ -1242,6 +1325,8 @@
+ 	h.timeThresholdEighths = defaultTimeThresholdEighths
+ 	h.minPNToRelaxReordering = protocol.InvalidPacketNumber
+ 	h.lostPackets.Reset()
++	h.blackHoles = newBlackHoleDetector()
++	h.blackHole = false
+ 	for pn, p := range h.hist.Packets() {
+ 		if p.EncryptionLevel.PacketNumberSpace() != protocol.PacketNumberSpaceAppData {
+ 			continue
+@@ -1257,14 +1342,68 @@
  	for pn := range h.hist.PathProbes() {
  		h.hist.RemovePathProbe(pn)
  	}
@@ -776,3 +1278,58 @@ diff -ruN a/monotime/time.go b/monotime/time.go
 +
 +// Now returns the current monotonic time.
 +func Now() Time { return monotime.Now() }
+diff -ruN a/packet_packer.go b/packet_packer.go
+--- a/packet_packer.go
++++ b/packet_packer.go
+@@ -724,8 +724,9 @@
+ 					// This DATAGRAM frame only fit without the length field, so it has to be the last frame in the packet.
+ 					break
+ 				}
+-			} else if pl.ack == nil && len(pl.frames) == 0 {
+-				// The DATAGRAM frame doesn't fit, and the packet doesn't contain an ACK or any other frames.
++			} else if size > maxPayloadSize || (pl.ack == nil && len(pl.frames) == 0) {
++				// The DATAGRAM frame doesn't fit, and the packet doesn't contain an ACK or any other frames,
++				// or it is larger than a whole packet, as after the packet size fell back to 1200 bytes.
+ 				// Discard this frame. There's no point in retrying this in the next packet,
+ 				// as it's unlikely that the available packet size will increase.
+ 				p.datagramQueue.Pop()
+diff -ruN a/packet_packer_datagram_test.go b/packet_packer_datagram_test.go
+--- a/packet_packer_datagram_test.go
++++ b/packet_packer_datagram_test.go
+@@ -0,0 +1,36 @@
++package quic
++
++import (
++	"testing"
++
++	"github.com/quic-go/quic-go/internal/monotime"
++	"github.com/quic-go/quic-go/internal/protocol"
++	"github.com/quic-go/quic-go/internal/utils"
++	"github.com/quic-go/quic-go/internal/wire"
++)
++
++type ackForEveryPacket struct{}
++
++func (ackForEveryPacket) GetAckFrame(protocol.EncryptionLevel, monotime.Time, bool) *wire.AckFrame {
++	return &wire.AckFrame{AckRanges: []wire.AckRange{{Smallest: 1, Largest: 1}}}
++}
++
++// A queued DATAGRAM frame larger than a whole packet, as after the packet size fell back to 1200 bytes, is dropped
++// even when every packet carries an ACK, so it does not hold back the datagrams behind it.
++func TestDatagramLargerThanAPacketIsDropped(t *testing.T) {
++	q := newDatagramQueue(func() {}, utils.DefaultLogger, nil)
++	p := &packetPacker{acks: ackForEveryPacket{}, framer: newFramer(nil), retransmissionQueue: newRetransmissionQueue(), datagramQueue: q}
++	small := &wire.DatagramFrame{DataLenPresent: true, Data: make([]byte, 100)}
++	for _, f := range []*wire.DatagramFrame{{DataLenPresent: true, Data: make([]byte, 1300)}, small} {
++		if ok, err := q.TryAdd(f); !ok || err != nil {
++			t.Fatal(ok, err)
++		}
++	}
++	pl := p.composeNextPacket(1163, false, true, monotime.Now(), protocol.Version1)
++	if pl.ack == nil || pl.numDatagramFrames != 1 || pl.frames[len(pl.frames)-1].Frame != small {
++		t.Fatalf("packed %d datagram frames, want only the 100-byte one", pl.numDatagramFrames)
++	}
++	if q.Peek() != nil {
++		t.Fatal("a datagram is still queued")
++	}
++}

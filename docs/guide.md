@@ -79,6 +79,8 @@ IPv4 address fails to resolve.
   below). It reports whether growth is on for the connection.
 - `(*Conn).Stats() ConnStats` returns what the connection measured: round-trip times, bytes and packets, losses, the congestion
   window, the controller and the path (see "Connection statistics" below).
+- `(*Conn).SupportsDatagrams()`, `SendDatagram(p)` and `ReceiveDatagram(ctx)` carry QUIC datagrams when both ends set
+  `Config.Datagrams` (see "Datagrams" below).
 - `(*Conn).ExportKey(label) ([32]byte, error)` derives 32 bytes from the
   TLS session with the RFC 9846 exporter. Both ends get the same bytes only
   if no one is in the middle, so a higher layer can sign them to tie its
@@ -96,7 +98,9 @@ IPv4 address fails to resolve.
   `SendStream` is the write half and `ReceiveStream` the read half of a
   unidirectional stream. A code above `MaxCode` cancels with code 0 and
   returns `ErrInvalidArgument`. An expired deadline returns
-  `os.ErrDeadlineExceeded`.
+  `os.ErrDeadlineExceeded`. `Stream.ID()` is the QUIC stream ID (RFC 9000
+  section 2.1), the same on both ends: 0, 4, 8 and so on for the dialer's
+  streams, 1, 5, 9 for the listener's.
 - Every blocking call returns `ctx.Err()` as soon as its context is done.
 
 ## Errors
@@ -116,6 +120,9 @@ Errors are matched with `errors.Is`. Those with a code are an `*Error` (use
   sending (its code). `ErrStreamCanceled`: this side canceled it.
 - `ErrTransport`: a QUIC transport error (its code) or any other failure.
 - `ErrMaxDialed`: `Listener.Dial` already has `MaxDialed` connections open.
+- `ErrDatagramsUnsupported`: a datagram call on a connection whose ends did
+  not both set `Config.Datagrams`. `ErrDatagramTooLarge` and
+  `ErrDatagramDropped`: see "Datagrams" below.
 - `ErrInvalidConfig`, `ErrInvalidArgument`.
 
 ## Packet size
@@ -124,6 +131,34 @@ A connection starts with packets of 1200 bytes of UDP payload, 1228 on the wire,
 carry; path MTU discovery then raises it, up to 1452, where the path allows. quic-go's own start is 1280 bytes, 1308 on
 the wire, which a path with a smaller MTU drops (a tunnel, or a carrier that translates IPv4 to IPv6) and the handshake
 then times out. A path that cannot carry 1228 bytes cannot run QUIC.
+
+A path can also carry less later, after a route change or on a relayed or mobile path, and nothing tells the sender (ICMP
+is not used). The sender then falls back to 1200 bytes when its losses show a black hole (RFC 8899 section 4.3): more
+than 3 loss bursts (the packets one loss detection pass declares lost) made only of packets larger than 1200 bytes, with
+no packet as large sent after them acknowledged, or 3 probe timeouts in a row with such a packet outstanding (the
+full-stop timeout of RFC 4821 section 7.7). It then searches again from 1200 bytes: one probe at a time, sent with the
+traffic at least 5 smoothed round trips after the previous one, 9 probes to find 1251 bytes on a path MTU of 1280. The
+lost data is sent again in the smaller packets. An outage of 3 probe timeouts while such a packet is outstanding also
+brings the size back to 1200 until the search raises it again. Once a search ends, the size is not probed again until
+a black hole or a new path.
+
+## Datagrams
+
+`Config.Datagrams` offers QUIC datagrams (RFC 9221) on `Listen` and `Dial`. It is off by default. A connection carries
+datagrams only when both ends set it, which `Conn.SupportsDatagrams` reports; otherwise `SendDatagram` and `ReceiveDatagram`
+return `ErrDatagramsUnsupported`. A datagram is protected by the keys of the connection and counts against its congestion
+window, but it is neither retransmitted nor flow controlled: it can be lost or arrive out of order.
+
+- `SendDatagram(p)` copies `p` into the connection's send queue and never blocks. quic-go queues at most 32 datagrams per
+  connection; while the queue is full, `p` is dropped with `ErrDatagramDropped`, as a UDP socket with a full buffer drops.
+- A datagram must fit in one packet on the current path: at most `ConnStats.MaxDatagramSize` minus 37 bytes (quic-go's
+  estimate of the packet overhead), 1163 bytes when a connection starts and up to 1415 once path MTU discovery has reached
+  1452. A larger `p` is `ErrDatagramTooLarge`. The limit follows the path MTU, and starts over on a new path or after a
+  black hole (see "Packet size").
+- `ReceiveDatagram(ctx)` returns the next datagram, `ctx.Err()` when the context ends and the connection's error once it
+  has ended. quic-go keeps at most 128 received datagrams per connection and drops the ones that arrive while 128 wait, so
+  read promptly.
+- The queues hold up to about 240 KiB per connection, which `MaxMemory` does not count (see [limits.md](limits.md)).
 
 ## Faster transfers for trusted peers
 
@@ -299,7 +334,7 @@ fmt.Printf("rtt %v (min %v) window %d in flight %d lost %d of %d packets via %s\
 | `BytesInFlight` | Bytes sent and neither acknowledged nor declared lost | bytes |
 | `CongestionController` | `"reno"`, `"cubic"` or `"bbr"`, from `Config.CongestionControl` | name |
 | `BandwidthEstimate` | The bottleneck bandwidth BBR measured (the highest delivery rate of the last ten round trips). 0 for `"reno"` and `"cubic"`, which measure none, and before the first sample | bytes per second |
-| `MaxDatagramSize` | Largest UDP payload this end sends on the current path; it grows as path MTU discovery succeeds | bytes |
+| `MaxDatagramSize` | Largest UDP payload this end sends on the current path; it grows as path MTU discovery succeeds and falls back to 1200 after a black hole (see "Packet size") | bytes |
 | `PathChanges` | How often the connection moved to a new path, as when the peer's NAT gives it a new port. The RTT fields, `CongestionWindow` and `BandwidthEstimate` start over on a new path | count |
 
 What the numbers say about a slow transfer:
@@ -324,7 +359,7 @@ controller, and a BBR controller. Nothing else is vendored.
 | Where | What |
 |---|---|
 | `internal/quicgo` | quic-go at the release named by `pin=` in `scripts/vendor-quicgo.sh` (also in `internal/quicgo/VERSION` with the module checksum), the non-test Go files of the packages the connection needs, plus `internal/quicgo/PATCH`. Generated: never edit it by hand |
-| `internal/quicgo/PATCH` | The only change to quic-go: the hook for a congestion controller and the counters `Conn.Stats` reads (a header lists the files) |
+| `internal/quicgo/PATCH` | The only change to quic-go: the hook for a congestion controller, the counters `Conn.Stats` reads, the datagram send that never blocks and the path MTU black hole detection (a header lists the files) |
 | `internal/bbr` | The BBR controller, copied once, with its license file |
 | `THIRD_PARTY_NOTICES` | The MIT notices of both and the BSD notice of the QUICHE code the BBR is a port of, which must stay |
 

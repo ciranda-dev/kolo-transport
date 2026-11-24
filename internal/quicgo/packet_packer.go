@@ -724,8 +724,9 @@ func (p *packetPacker) composeNextPacket(
 					// This DATAGRAM frame only fit without the length field, so it has to be the last frame in the packet.
 					break
 				}
-			} else if pl.ack == nil && len(pl.frames) == 0 {
-				// The DATAGRAM frame doesn't fit, and the packet doesn't contain an ACK or any other frames.
+			} else if size > maxPayloadSize || (pl.ack == nil && len(pl.frames) == 0) {
+				// The DATAGRAM frame doesn't fit, and the packet doesn't contain an ACK or any other frames,
+				// or it is larger than a whole packet, as after the packet size fell back to 1200 bytes.
 				// Discard this frame. There's no point in retrying this in the next packet,
 				// as it's unlikely that the available packet size will increase.
 				p.datagramQueue.Pop()

@@ -41,6 +41,8 @@ type SentPacketHandler interface {
 
 	GetLossDetectionTimeout() monotime.Time
 	OnLossDetectionTimeout(now monotime.Time) error
+	// BlackHoleDetected reports, once, that losses showed the path no longer carries packets larger than 1200 bytes.
+	BlackHoleDetected() bool
 
 	MigratedPath(now monotime.Time, initialMaxPacketSize protocol.ByteCount)
 }

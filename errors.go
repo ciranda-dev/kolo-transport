@@ -39,6 +39,12 @@ var (
 	ErrMaxDialed = errors.New("kolotransport: too many dialed connections")
 	// ErrStreamCanceled means this side canceled the stream.
 	ErrStreamCanceled = errors.New("kolotransport: stream canceled")
+	// ErrDatagramsUnsupported means a datagram call on a connection whose ends did not both set Config.Datagrams.
+	ErrDatagramsUnsupported = errors.New("kolotransport: datagrams not supported by both ends")
+	// ErrDatagramTooLarge means the datagram does not fit in one packet on the current path.
+	ErrDatagramTooLarge = errors.New("kolotransport: datagram too large")
+	// ErrDatagramDropped means the datagram send queue was full and the datagram was dropped, as a full UDP socket drops.
+	ErrDatagramDropped = errors.New("kolotransport: datagram dropped, send queue full")
 )
 
 // Error is a connection or stream error with its numeric code; Unwrap returns one of the sentinels.
@@ -75,6 +81,7 @@ func mapErr(err error) error {
 		handshakeErr *quic.HandshakeTimeoutError
 		resetErr     *quic.StatelessResetError
 		versionErr   *quic.VersionNegotiationError
+		tooLargeErr  *quic.DatagramTooLargeError
 	)
 	switch {
 	case err == nil:
@@ -116,6 +123,8 @@ func mapErr(err error) error {
 		return ErrPeerClosed
 	case errors.As(err, &versionErr):
 		return ErrHandshake
+	case errors.As(err, &tooLargeErr):
+		return ErrDatagramTooLarge
 	case errors.Is(err, quic.ErrServerClosed), errors.Is(err, quic.ErrStreamClosed), errors.Is(err, net.ErrClosed):
 		return ErrClosed
 	}

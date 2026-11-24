@@ -274,7 +274,7 @@ func (l *Listener) Accept(ctx context.Context) (*Conn, error) {
 		delete(l.open, qc)
 		l.mu.Unlock()
 	})
-	return &Conn{qc: qc, grow: l.grow}, nil
+	return &Conn{qc: qc, grow: l.grow, datagrams: datagramsOn(qc)}, nil
 }
 
 // quicConfig is the listener's Config for quic-go, with the window growth hook when growth is on.
@@ -328,7 +328,7 @@ func (l *Listener) Dial(ctx context.Context, addr netip.AddrPort) (*Conn, error)
 		l.dialed--
 		l.mu.Unlock()
 	})
-	return &Conn{qc: qc, grow: l.grow}, nil
+	return &Conn{qc: qc, grow: l.grow, datagrams: datagramsOn(qc)}, nil
 }
 
 // WritePacket sends b as one non-QUIC datagram from the listener's socket, blocking as long as its WriteTo does; b[0]&0xC0 must be 0.
@@ -462,11 +462,18 @@ func (l *Listener) closeTransport() error {
 
 // Conn is a connection to one peer, carrying multiplexed streams.
 type Conn struct {
-	qc       *quic.Conn
-	grow     *growth
-	released chan struct{}
-	ctxOnce  sync.Once
-	ctx      context.Context
+	qc        *quic.Conn
+	grow      *growth
+	datagrams bool
+	released  chan struct{}
+	ctxOnce   sync.Once
+	ctx       context.Context
+}
+
+// datagramsOn reports whether both ends offered datagrams; a Conn exists only after the handshake, so the peer's offer is known.
+func datagramsOn(qc *quic.Conn) bool {
+	d := qc.ConnectionState().SupportsDatagrams
+	return d.Local && d.Remote
 }
 
 // Context is canceled when the connection ends; its context.Cause is the error the connection's calls return.
@@ -515,7 +522,7 @@ func Dial(ctx context.Context, addr string, cfg *Config) (*Conn, error) {
 		return nil, ctxErr(ctx, err)
 	}
 	useCongestionControl(qc, c)
-	conn := &Conn{qc: qc, grow: grow, released: make(chan struct{})}
+	conn := &Conn{qc: qc, grow: grow, datagrams: datagramsOn(qc), released: make(chan struct{})}
 	context.AfterFunc(qc.Context(), func() {
 		tr.Close()
 		pc.Close()
@@ -630,6 +637,37 @@ func (c *Conn) ExportKey(label string) ([32]byte, error) {
 	}
 	copy(key[:], b)
 	return key, nil
+}
+
+// SupportsDatagrams reports whether both ends set Config.Datagrams, which SendDatagram and ReceiveDatagram need.
+func (c *Conn) SupportsDatagrams() bool { return c.datagrams }
+
+// SendDatagram queues p as one QUIC datagram (RFC 9221), which may be lost, and never blocks; p can be reused once it returns.
+// A p that does not fit in one packet on the current path is ErrDatagramTooLarge, and a full send queue drops p with ErrDatagramDropped.
+func (c *Conn) SendDatagram(p []byte) error {
+	if !c.datagrams {
+		return ErrDatagramsUnsupported
+	}
+	queued, err := c.qc.TrySendDatagram(p)
+	switch {
+	case err != nil:
+		return mapErr(err)
+	case !queued:
+		return ErrDatagramDropped
+	}
+	return nil
+}
+
+// ReceiveDatagram waits for the next datagram from the peer.
+func (c *Conn) ReceiveDatagram(ctx context.Context) ([]byte, error) {
+	if !c.datagrams {
+		return nil, ErrDatagramsUnsupported
+	}
+	p, err := c.qc.ReceiveDatagram(ctx)
+	if err != nil {
+		return nil, ctxErr(ctx, err)
+	}
+	return p, nil
 }
 
 // Close closes the connection with code 0.

@@ -25,20 +25,23 @@ Every option, default and bound of kolo-transport, with the reason for it. A val
 | `MaxGrownConnReceiveWindow` (growth ceiling of a trusted connection; `WindowGrowth` only) | 8 MiB (`DefaultMaxGrownConnReceiveWindow`), or `MaxConnReceiveWindow` and `MaxGrownStreamReceiveWindow` if higher | the larger of `MaxConnReceiveWindow` and `MaxGrownStreamReceiveWindow`, to 64 MiB | Memory: quic-go keeps the connection window at 1.5 times a growing stream window |
 | `MaxGrownMemory` (window growth shared by the trusted connections of a `Listener`; `WindowGrowth` only) | 64 MiB (`DefaultMaxGrownMemory`) | 1 MiB to 64 GiB | Memory: bounds how many connections can hold a grown window |
 | `Network` (UDP network of the socket `Listen` opens) | `"udp4"` | `"udp4"` only | Protocol: kolo-transport is IPv4 only |
+| `Datagrams` (offers QUIC datagrams, RFC 9221) | false | true or false | Protocol: a connection carries datagrams only when both ends offer them; off, nothing changes |
 | `CongestionControl` (pacing of what this end sends) | `"reno"` | `"reno"`, `"cubic"` or `"bbr"` | Protocol: Reno is quic-go's own and `"cubic"` is the Cubic branch of the same code; BBR fills a link that loses packets at random, but holds a queue and takes bandwidth from Reno flows (see "Queue" below and the [guide](guide.md#congestion-control)) |
 | Retry token life (fixed, follows `HandshakeTimeout`) | 10s | 1s to 60s | Security: quic-go sets it to the handshake timeout (quic-go config.go:17-23); a longer life also lengthens the window in which a token can be replayed from one IP |
 | NEW_TOKEN token life (fixed) | expired at any age, even after the wall clock steps back (`MaxTokenAge` is the smallest duration) | fixed | Security: every new attempt goes through Retry |
 | Accept queue (fixed in quic-go) | 32 handshaked connections | fixed | Protocol: fixed by quic-go (internal/protocol/params.go:47); `MaxConns` bounds the total |
 | Non-QUIC packet queue (fixed in quic-go) | 32 datagrams | fixed | Protocol: fixed by quic-go (transport.go:709) |
+| Path MTU black hole detection (fixed) | more than 3 suspicious loss bursts, or 3 probe timeouts in a row | fixed | Protocol: MAX_PROBES of RFC 8899 section 5.1.2; the packet size falls back to 1200 bytes (RFC 9000 section 14.1) and the search starts again (see "Packet size" in [guide.md](guide.md#packet-size)) |
 | `MaxPacketSize` (non-QUIC datagram) | 1200 bytes | fixed | Protocol: the 1200 bytes QUIC starts with, so it fits any path QUIC works on |
 | Read buffer (fixed in quic-go) | 1452 bytes | fixed | Protocol: fixed by quic-go (internal/protocol/protocol.go:111) |
+| Datagram queues (fixed in quic-go; only on a connection whose ends both set `Datagrams`) | 128 received and 32 queued to send, per connection | fixed | Memory: fixed by quic-go (datagram_queue.go:15-16); each datagram is at most one packet of 1452 bytes, so a connection holds at most 160 × 1452 bytes (227 KiB), about 240 KiB of heap since Go rounds each buffer up to 1536 bytes; `MaxMemory` does not count it |
 | `CloseWithError` message | 256 bytes | 0 to 256 | Protocol: 256 bytes always fit one packet; peers drop the text (see Errors in [guide.md](guide.md#errors)) |
 | `Listener.Close` fallback (fixed) | 1s | fixed | Protocol: closes a `PacketConn` that ignores read deadlines (see [Caller-supplied sockets](guide.md#caller-supplied-sockets)) |
 
 quic-go file and line references are at quic-go v0.65.0.
 
 `MaxConns`, `MaxConnsPerIP`, `MaxDialed`, `MaxMemory` and `AcceptFunc`
-apply to `Listen` and `ListenConn` only; `CongestionControl` applies to `Listen`,
+apply to `Listen` and `ListenConn` only; `CongestionControl` and `Datagrams` apply to `Listen`,
 `ListenConn` and `Dial`, and so to every connection they make; `Network` applies to `Listen`,
 `ListenConn` checks it but keeps the caller's socket as it is, and `Dial`
 ignores it; the windows apply to `Listen` and `Dial`, and quic-go gets each as
@@ -139,7 +142,7 @@ separately. At the defaults that is 2 × 16 × 256 KiB × 96 = 768 MiB plus
 512 KiB × 176 = 88 MiB, about 856 MiB per connection, about 3.3 GiB per
 source address (4 connections) and about 84 GiB for all 100 connections
 (25 addresses), plus about 27 GiB for the 32 connections `Listener.Dial`
-may open. With the default windows, one connection's worst case is
+may open. A connection with datagrams adds its datagram queues, about 240 KiB (see the table above). With the default windows, one connection's worst case is
 856 MiB with 16 streams, about 1.6 GiB with 32, about 3.1 GiB with 64 and
 about 4.8 GiB with 100. Streams this side opens add their own retention. To bound
 the heap, lower `MaxConns`, `MaxDialed`, `MaxIncomingStreams`, `MaxStreamReceiveWindow`

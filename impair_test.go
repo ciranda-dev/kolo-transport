@@ -2,6 +2,7 @@ package kolotransport
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -441,7 +442,7 @@ func TestKeepAliveHoldsANATMapping(t *testing.T) {
 
 // A path that stops carrying anything for good ends the connection with ErrTimeout after the idle timeout, so an app
 // learns of it within seconds and can dial again. A path that drops only the large datagrams does not end it: the
-// acknowledgements and keepalives still pass, so what an app waits for needs its own time limit.
+// packet size falls back to 1200 bytes (TestRecoversWhenThePathMTUDrops).
 func TestABlackholeEndsTheConnectionWithErrTimeout(t *testing.T) {
 	checkGoroutines(t)
 	up, down := path(8*mbps, 0, 0)
@@ -456,5 +457,145 @@ func TestABlackholeEndsTheConnectionWithErrTimeout(t *testing.T) {
 	}
 	if d := time.Since(start); d > 20*time.Second {
 		t.Fatalf("the connection ended after %v, the idle timeout is 3s", d)
+	}
+}
+
+// A path whose MTU drops to 1280 after the connection found a larger packet size, as after a route change or on a
+// relayed or mobile path, still carries the data: the loss of the large packets brings the size back to 1200 bytes and
+// the search starts again below the new MTU. The drop comes while the connection is idle, mid-transfer, or between
+// two answers to requests.
+func TestRecoversWhenThePathMTUDrops(t *testing.T) {
+	checkGoroutines(t)
+	const size = 6 << 20
+	for _, tc := range []struct {
+		name    string
+		answers int   // 0 sends size bytes on one stream; otherwise the client asks answers times for size/answers bytes
+		dropAt  int64 // bytes of the first answer read before the MTU drops; 0 drops it before the first request
+	}{
+		{"while idle", 0, 0},
+		{"mid-transfer", 0, 1 << 20},
+		{"between answers", 24, size / 24},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+			l, err := Listen(ctx, "127.0.0.1:0", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer l.Close()
+			p, _ := path(20*mbps, 0, 0)
+			link, err := netsim.New(l.Addr().String(), p, p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer link.Close()
+			server := make(chan *Conn, 1)
+			go func() {
+				conn, err := l.Accept(ctx)
+				if err != nil {
+					return
+				}
+				server <- conn
+				for {
+					st, err := conn.AcceptStream(ctx)
+					if err != nil {
+						return
+					}
+					var n [4]byte
+					if _, err := io.ReadFull(st, n[:]); err != nil {
+						return
+					}
+					st.Write(make([]byte, binary.BigEndian.Uint32(n[:])))
+					st.Close()
+				}
+			}()
+			conn, err := Dial(ctx, link.Addr(), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			ask := func(n int) (*Stream, error) {
+				st, err := conn.OpenStream(ctx)
+				if err != nil {
+					return nil, err
+				}
+				if _, err := st.Write(binary.BigEndian.AppendUint32(nil, uint32(n))); err != nil {
+					return nil, err
+				}
+				return st, st.Close()
+			}
+			if st, err := ask(1); err != nil {
+				t.Fatal(err)
+			} else if _, err := io.Copy(io.Discard, st); err != nil {
+				t.Fatal(err)
+			}
+			srv := <-server
+			// Probes go out with the traffic: keep the connection busy until discovery raised the size.
+			for deadline := time.Now().Add(15 * time.Second); srv.Stats().MaxDatagramSize <= 1300; {
+				if time.Now().After(deadline) {
+					t.Fatal("path MTU discovery did not raise the packet size in 15 s")
+				}
+				st, err := ask(1)
+				if err != nil {
+					t.Fatal(err)
+				}
+				io.Copy(io.Discard, st)
+				time.Sleep(50 * time.Millisecond)
+			}
+			if tc.dropAt == 0 {
+				link.SetMTU(1280)
+			}
+			dropped := time.Now()
+			var read atomic.Int64
+			done := make(chan error, 1)
+			go func() {
+				count, each := 1, size
+				if tc.answers > 0 {
+					count, each = tc.answers, size/tc.answers
+				}
+				for i := range count {
+					st, err := ask(each)
+					if err != nil {
+						done <- err
+						return
+					}
+					if i == 0 && tc.dropAt > 0 {
+						n, err := io.CopyN(io.Discard, st, tc.dropAt)
+						read.Add(n)
+						if err != nil {
+							done <- err
+							return
+						}
+						link.SetMTU(1280)
+						dropped = time.Now()
+					}
+					n, err := io.Copy(io.Discard, st)
+					read.Add(n)
+					if err != nil {
+						done <- err
+						return
+					}
+				}
+				done <- nil
+			}()
+			select {
+			case err := <-done:
+				if n := read.Load(); err != nil || n != size {
+					t.Fatalf("read %d of %d bytes: %v", n, size, err)
+				}
+			case <-time.After(20 * time.Second):
+				conn.Close()
+				<-done
+				t.Fatalf("read %d of %d bytes in 20 s after the MTU dropped to 1280; server stats %+v", read.Load(), size, srv.Stats())
+			}
+			if link.Down().DroppedMTU == 0 {
+				t.Fatal("no packet was over the cap: the test does not test it")
+			}
+			if got := srv.Stats().MaxDatagramSize; got > 1280-28 {
+				t.Fatalf("the sender still sends %d-byte packets over a 1280-byte MTU", got)
+			}
+			t.Logf("6 MiB in %v after the drop; packets of %d bytes at the end", time.Since(dropped).Round(time.Millisecond), srv.Stats().MaxDatagramSize)
+		})
 	}
 }
